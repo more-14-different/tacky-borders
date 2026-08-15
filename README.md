@@ -7,7 +7,7 @@ _tacky-borders_ lets you customize window borders on Windows 10 and 11.
 
 ### Pre-built Release
 
-The easiest way to install _tacky-borders_ is to download a pre-built release from the [releases](https://github.com/lukeyou05/tacky-borders/releases) page.
+The easiest way to install _tacky-borders_ is to download a pre-built release from the [releases](https://github.com/luke-you/tacky-borders/releases) page.
 
 When you run the .exe for the first time, _tacky-borders_ will automatically generate a config file for you in ```%userprofile%/.config/tacky-borders/```.
 
@@ -21,7 +21,7 @@ Alternatively, if you wish to build it yourself, you can follow these steps:
 2. Clone the repository:
 
    ```sh
-   git clone https://github.com/lukeyou05/tacky-borders.git
+   git clone https://github.com/luke-you/tacky-borders.git
    ```
 
 3. Navigate to the project directory:
