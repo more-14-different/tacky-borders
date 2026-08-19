@@ -165,22 +165,64 @@ impl WidthConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(transparent)]
-pub struct OffsetConfig(i32);
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum OffsetConfig {
+    Uniform(i32),
+    PerSide(Offset),
+}
 
 impl OffsetConfig {
     pub fn new(offset: i32) -> Self {
-        Self(offset)
+        Self::Uniform(offset)
     }
 
-    /// Returns a DPI-adjusted raw offset value
-    pub fn to_offset(&self, dpi: f32) -> i32 {
-        (self.0 as f32 * dpi / 96.0).round() as i32
+    /// Returns a DPI-adjusted offset for each side
+    pub fn to_offset(&self, dpi: f32) -> Offset {
+        let scale = |value: i32| (value as f32 * dpi / 96.0).round() as i32;
+        match *self {
+            Self::Uniform(offset) => Offset::new(scale(offset)),
+            Self::PerSide(offset) => Offset {
+                top: scale(offset.top),
+                left: scale(offset.left),
+                right: scale(offset.right),
+                bottom: scale(offset.bottom),
+            },
+        }
     }
 
     fn serde_default() -> Self {
-        Self(-1)
+        Self::Uniform(-1)
+    }
+}
+
+impl Default for OffsetConfig {
+    fn default() -> Self {
+        Self::Uniform(0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Offset {
+    #[serde(default)]
+    pub top: i32,
+    #[serde(default)]
+    pub left: i32,
+    #[serde(default)]
+    pub right: i32,
+    #[serde(default)]
+    pub bottom: i32,
+}
+
+impl Offset {
+    pub fn new(offset: i32) -> Self {
+        Self {
+            top: offset,
+            left: offset,
+            right: offset,
+            bottom: offset,
+        }
     }
 }
 

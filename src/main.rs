@@ -119,6 +119,10 @@ OPTIONS for set-color:
   <color> is a hex string like \"#RRGGBB\" or \"#RRGGBBAA\", \"accent\", or a JSON gradient object:
     '{\"colors\":[\"#ffffff\",\"#000000\"],\"direction\":\"90deg\"}'
 
+OPTIONS for set-offset:
+  <offset> is a number applied to all sides (e.g. -1), or a JSON object:
+    '{\"top\":-1,\"left\":0,\"right\":0,\"bottom\":-1}'
+
 OPTIONS for set-color, set-width, set-offset, set-radius:
   -f, --focused             only update the currently focused window's border;
                             all other borders are left unchanged
@@ -251,8 +255,10 @@ fn parse_width_arg(s: &str) -> anyhow::Result<WidthConfig> {
 }
 
 fn parse_offset_arg(s: &str) -> anyhow::Result<OffsetConfig> {
-    let offset: i32 = s.parse()?;
-    Ok(OffsetConfig::new(offset))
+    serde_json::from_str(s).or_else(|_| {
+        let offset: i32 = s.parse()?;
+        Ok(OffsetConfig::new(offset))
+    })
 }
 
 fn parse_radius_arg(s: &str) -> anyhow::Result<RadiusConfig> {

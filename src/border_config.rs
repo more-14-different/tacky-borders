@@ -3,7 +3,9 @@ use windows::Win32::Foundation::HWND;
 use crate::animations::AnimationsConfig;
 use crate::border_drawer::BorderDrawer;
 use crate::colors::ColorBrushConfig;
-use crate::config::{Global, OffsetConfig, RadiusConfig, WidthConfig, WindowRule, ZOrderMode};
+use crate::config::{
+    Global, Offset, OffsetConfig, RadiusConfig, WidthConfig, WindowRule, ZOrderMode,
+};
 use crate::effects::EffectsConfig;
 use crate::render_backend::RenderBackendConfig;
 
@@ -76,7 +78,7 @@ impl BorderConfig {
         self.width.to_width(dpi as f32)
     }
 
-    pub fn offset_at(&self, dpi: u32) -> i32 {
+    pub fn offset_at(&self, dpi: u32) -> Offset {
         self.offset.to_offset(dpi as f32)
     }
 

@@ -34,7 +34,7 @@ use crate::animations::{AnimType, AnimVec};
 use crate::border_config::BorderConfig;
 use crate::border_drawer::BorderDrawer;
 use crate::colors::ColorBrushConfig;
-use crate::config::{WindowRule, ZOrderMode};
+use crate::config::{Offset, WindowRule, ZOrderMode};
 use crate::ipc::{
     IpcPayload, IpcSetColorsPayload, IpcSetOffsetPayload, IpcSetRadiusPayload, IpcSetWidthPayload,
 };
@@ -77,7 +77,7 @@ pub struct WindowBorder {
     pub tracking_window: HWND,
     window_state: WindowState,
     window_rect: RECT,
-    border_offset: i32,
+    border_offset: Offset,
     border_padding: i32, // padding to accommodate things like shadow/glow effects
     current_monitor: HMONITOR,
     current_dpi: u32,
@@ -286,9 +286,17 @@ impl WindowBorder {
         let border_padding = self.border_padding;
 
         Ok(D2D_SIZE_U {
-            width: (monitor_width as i32 + ((stroke_width + border_offset + border_padding) * 2))
+            width: (monitor_width as i32
+                + stroke_width * 2
+                + border_offset.left
+                + border_offset.right
+                + border_padding * 2)
                 .max(1) as u32,
-            height: (monitor_height as i32 + ((stroke_width + border_offset + border_padding) * 2))
+            height: (monitor_height as i32
+                + stroke_width * 2
+                + border_offset.top
+                + border_offset.bottom
+                + border_padding * 2)
                 .max(1) as u32, // size must be at least 1 otherwise resize/init renderer fails
         })
     }
@@ -410,12 +418,13 @@ impl WindowBorder {
             return Err(e);
         }
 
-        let adjustment = self.drawer.stroke_width + self.border_offset + self.border_padding;
+        let stroke_width = self.drawer.stroke_width;
+        let border_padding = self.border_padding;
         // Make space for the border + padding
-        self.window_rect.top -= adjustment;
-        self.window_rect.left -= adjustment;
-        self.window_rect.right += adjustment;
-        self.window_rect.bottom += adjustment;
+        self.window_rect.top -= stroke_width + self.border_offset.top + border_padding;
+        self.window_rect.left -= stroke_width + self.border_offset.left + border_padding;
+        self.window_rect.right += stroke_width + self.border_offset.right + border_padding;
+        self.window_rect.bottom += stroke_width + self.border_offset.bottom + border_padding;
 
         Ok(())
     }
