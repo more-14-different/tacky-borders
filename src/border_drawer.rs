@@ -522,13 +522,16 @@ impl BorderDrawer {
         }
     }
 
-    pub fn set_anims_timer_if_needed(&mut self, border_window: HWND) {
-        self.animations
-            .set_timer_if_needed(border_window, &mut self.last_anim_time);
+    pub fn animations_enabled(&self) -> bool {
+        self.animations.is_enabled()
     }
 
-    pub fn destroy_anims_timer(&mut self) {
-        self.animations.destroy_timer();
+    pub fn animation_fps(&self) -> u32 {
+        self.animations.fps()
+    }
+
+    pub fn reset_animation_clock(&mut self) {
+        self.last_anim_time = Some(time::Instant::now());
     }
 
     pub fn animate(&mut self, bounds: D2D_RECT_F, window_state: WindowState) -> anyhow::Result<()> {

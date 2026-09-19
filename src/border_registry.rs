@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowIdentity {
     pub hwnd: isize,
     pub process_id: u32,
@@ -172,5 +172,117 @@ mod tests {
             registry.get_by_key(10).unwrap().state,
             BorderLifecycleState::Active
         );
+    }
+}
+
+// Pure reconciliation planning is kept outside BorderRuntime so HWND reuse and create/destroy
+// ordering can be unit-tested without a live desktop/window.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReconcilePlan {
+    pub destroy: Vec<WindowIdentity>,
+    pub create: Vec<WindowIdentity>,
+}
+
+pub fn plan_reconciliation(
+    current: &[BorderRecord],
+    present: &HashMap<isize, WindowIdentity>,
+    creatable: &HashSet<isize>,
+) -> ReconcilePlan {
+    let mut plan = ReconcilePlan::default();
+    let current_by_hwnd: HashMap<isize, WindowIdentity> = current
+        .iter()
+        .map(|record| (record.tracking.hwnd, record.tracking))
+        .collect();
+
+    for record in current {
+        match present.get(&record.tracking.hwnd) {
+            Some(identity) if *identity == record.tracking => {}
+            _ => plan.destroy.push(record.tracking),
+        }
+    }
+
+    for (hwnd, identity) in present {
+        let already_current = current_by_hwnd.get(hwnd) == Some(identity);
+        if !already_current && creatable.contains(hwnd) {
+            plan.create.push(*identity);
+        }
+    }
+
+    // Determinism makes logs/tests easier to reason about; runtime always executes destroy first.
+    plan.destroy
+        .sort_by_key(|identity| (identity.hwnd, identity.process_id, identity.thread_id));
+    plan.create
+        .sort_by_key(|identity| (identity.hwnd, identity.process_id, identity.thread_id));
+    plan
+}
+
+#[cfg(test)]
+mod phase2_reconciliation_tests {
+    use super::{
+        BorderLifecycleState, BorderRecord, ReconcilePlan, WindowIdentity, plan_reconciliation,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    fn id(hwnd: isize, pid: u32, tid: u32) -> WindowIdentity {
+        WindowIdentity {
+            hwnd,
+            process_id: pid,
+            thread_id: tid,
+        }
+    }
+
+    fn record(identity: WindowIdentity) -> BorderRecord {
+        BorderRecord {
+            tracking: identity,
+            border_hwnd: identity.hwnd + 1000,
+            state: BorderLifecycleState::Active,
+        }
+    }
+
+    #[test]
+    fn same_identity_is_kept_even_when_temporarily_not_creatable() {
+        let identity = id(10, 1, 2);
+        let present = HashMap::from([(identity.hwnd, identity)]);
+        let plan = plan_reconciliation(&[record(identity)], &present, &HashSet::new());
+        assert_eq!(plan, ReconcilePlan::default());
+    }
+
+    #[test]
+    fn missing_identity_is_destroyed() {
+        let old = id(10, 1, 2);
+        let plan = plan_reconciliation(&[record(old)], &HashMap::new(), &HashSet::new());
+        assert_eq!(plan.destroy, vec![old]);
+        assert!(plan.create.is_empty());
+    }
+
+    #[test]
+    fn missed_visible_window_is_created() {
+        let new = id(10, 1, 2);
+        let present = HashMap::from([(new.hwnd, new)]);
+        let creatable = HashSet::from([new.hwnd]);
+        let plan = plan_reconciliation(&[], &present, &creatable);
+        assert_eq!(plan.create, vec![new]);
+        assert!(plan.destroy.is_empty());
+    }
+
+    #[test]
+    fn hwnd_reuse_destroys_old_identity_before_creating_new_identity() {
+        let old = id(10, 1, 2);
+        let new = id(10, 7, 8);
+        let present = HashMap::from([(new.hwnd, new)]);
+        let creatable = HashSet::from([new.hwnd]);
+        let plan = plan_reconciliation(&[record(old)], &present, &creatable);
+        assert_eq!(plan.destroy, vec![old]);
+        assert_eq!(plan.create, vec![new]);
+    }
+
+    #[test]
+    fn hwnd_reuse_to_hidden_window_only_destroys_old_border() {
+        let old = id(10, 1, 2);
+        let new = id(10, 7, 8);
+        let present = HashMap::from([(new.hwnd, new)]);
+        let plan = plan_reconciliation(&[record(old)], &present, &HashSet::new());
+        assert_eq!(plan.destroy, vec![old]);
+        assert!(plan.create.is_empty());
     }
 }

@@ -1,12 +1,10 @@
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time;
-use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
 use windows_numerics::{Matrix3x2, Vector2};
 
-use crate::anim_timer::AnimationTimer;
 use crate::colors::ColorBrush;
 use crate::config::{serde_default_bool, serde_default_i32};
 use crate::utils::cubic_bezier;
@@ -52,7 +50,6 @@ impl AnimationsConfig {
 pub struct Animations {
     pub active: Vec<AnimParams>,
     pub inactive: Vec<AnimParams>,
-    pub timer: Option<AnimationTimer>,
     pub fps: i32,
     pub fade_progress: f32,
     pub spiral_progress: f32,
@@ -171,21 +168,12 @@ impl Animations {
         }
     }
 
-    pub fn set_timer_if_needed(
-        &mut self,
-        border_window: HWND,
-        last_anim_time: &mut Option<time::Instant>,
-    ) {
-        if self.timer.is_none() && (!self.active.is_empty() || !self.inactive.is_empty()) {
-            let timer_duration = (1000.0 / self.fps as f32) as u64;
-            self.timer = Some(AnimationTimer::new(border_window, timer_duration));
-
-            *last_anim_time = Some(time::Instant::now());
-        }
+    pub fn is_enabled(&self) -> bool {
+        !self.active.is_empty() || !self.inactive.is_empty()
     }
 
-    pub fn destroy_timer(&mut self) {
-        self.timer = None;
+    pub fn fps(&self) -> u32 {
+        self.fps.max(1) as u32
     }
 
     pub fn update_fade_progress(&mut self, window_state: WindowState) {

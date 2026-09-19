@@ -18,9 +18,7 @@ use tacky_borders::config::{OffsetConfig, RadiusConfig, WidthConfig};
 use tacky_borders::iocp::UnixStream;
 use tacky_borders::ipc::{IpcCommand, socket_path};
 use tacky_borders::sys_tray_icon::create_tray_icon;
-use tacky_borders::utils::{
-    LogIfErr, imm_disable_ime, set_process_dpi_awareness_context, spawn_window_state_poller,
-};
+use tacky_borders::utils::{LogIfErr, imm_disable_ime, set_process_dpi_awareness_context};
 use tacky_borders::{
     APP_STATE, attach_parent_console, create_borders_for_existing_windows, is_unwanted_instance,
     register_border_window_class, set_event_hook,
@@ -90,7 +88,6 @@ fn run_daemon() {
     }
 
     create_borders_for_existing_windows().log_if_err();
-    spawn_window_state_poller();
 
     unsafe {
         let mut message = MSG::default();

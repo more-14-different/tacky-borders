@@ -33,7 +33,9 @@ use crate::animations::{AnimType, AnimVec};
 use crate::border_config::BorderConfig;
 use crate::border_drawer::BorderDrawer;
 use crate::border_registry::WindowIdentity;
-use crate::border_runtime::{request_destroy_border, request_mark_border_active};
+use crate::border_runtime::{
+    request_destroy_border_identity, request_mark_border_active, request_set_border_animation,
+};
 use crate::colors::ColorBrushConfig;
 use crate::config::{Offset, WindowRule, ZOrderMode};
 use crate::ipc::{
@@ -43,13 +45,13 @@ use crate::komorebi::WindowKind;
 use crate::render_backend::{RenderBackend, RenderBackendConfig};
 use crate::utils::{
     LogIfErr, OwnedHWND, ReentrancyBlocker, ReentrancyBlockerExt, StandaloneWindowsError,
-    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_ANIMATE, WM_APP_FOREGROUND,
-    WM_APP_HIDECLOAKED, WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND,
-    WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED,
-    WindowsCompatibleError, WindowsCompatibleResult, WindowsContext, are_rects_same_size,
-    get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title, has_native_border,
-    is_window, is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible,
-    loword, monitor_from_window, post_message_w,
+    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_FOREGROUND, WM_APP_HIDECLOAKED,
+    WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND, WM_APP_MINIMIZESTART,
+    WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED, WindowsCompatibleError,
+    WindowsCompatibleResult, WindowsContext, are_rects_same_size, get_dpi_for_monitor,
+    get_monitor_info, get_window_rule, get_window_title, has_native_border, is_window,
+    is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible, loword,
+    monitor_from_window, post_message_w,
 };
 use crate::{APP_STATE, BG_SERVICES};
 
@@ -90,6 +92,7 @@ pub struct WindowBorder {
     config: BorderConfig, // cached config values
     is_paused: bool,
     is_closing: bool,
+    animation_registered: bool,
     last_reorder_time: Option<time::Instant>,
     is_debouncing_reorder: bool,
     consecutive_reorders: u64,
@@ -128,6 +131,7 @@ impl WindowBorder {
             config: Default::default(),
             is_paused: Default::default(),
             is_closing: false,
+            animation_registered: false,
             last_reorder_time: None,
             is_debouncing_reorder: false,
             consecutive_reorders: 0,
@@ -255,7 +259,7 @@ impl WindowBorder {
                 )
             };
 
-            self.drawer.set_anims_timer_if_needed(self.border_window.0);
+            self.start_animation_clock_if_needed();
         }
 
         // Handle the edge case where the tracking window is already minimized
@@ -827,14 +831,58 @@ impl WindowBorder {
             self.update_window_rect().log_if_err();
             self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
             self.render().log_if_err();
-            self.drawer.set_anims_timer_if_needed(self.border_window.0);
+            self.start_animation_clock_if_needed();
         }
         self.is_paused = false;
     }
 
+    fn start_animation_clock_if_needed(&mut self) {
+        if self.animation_registered || !self.drawer.animations_enabled() {
+            return;
+        }
+        let Some(identity) = self.tracking_identity else {
+            return;
+        };
+        if !identity.still_matches() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+
+        self.drawer.reset_animation_clock();
+        request_set_border_animation(identity, Some(self.drawer.animation_fps()));
+        self.animation_registered = true;
+    }
+
+    fn stop_animation_clock(&mut self) {
+        if !self.animation_registered {
+            return;
+        }
+        if let Some(identity) = self.tracking_identity {
+            request_set_border_animation(identity, None);
+        }
+        self.animation_registered = false;
+    }
+
+    pub fn animation_tick(&mut self) {
+        if self.is_paused || self.is_closing {
+            return;
+        }
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+
+        let bounds = self.compute_border_bounds();
+        self.drawer.animate(bounds, self.window_state).log_if_err();
+    }
+
+    pub fn tracked_identity(&self) -> Option<WindowIdentity> {
+        self.tracking_identity
+    }
+
     pub fn prepare_for_destroy(&mut self) {
         self.is_paused = true;
-        self.drawer.destroy_anims_timer();
+        self.stop_animation_clock();
         unsafe {
             KillTimer(Some(self.border_window.0), REORDER_TIMER_ID).log_if_err();
             KillTimer(Some(self.border_window.0), INITIALIZE_TIMER_ID).log_if_err();
@@ -847,12 +895,12 @@ impl WindowBorder {
         if self.is_closing {
             return;
         }
-        if let Some(identity) = self.tracking_identity
-            && request_destroy_border(identity)
-        {
-            self.is_closing = true;
-            self.prepare_for_destroy();
-        }
+        let Some(identity) = self.tracking_identity else {
+            return;
+        };
+        request_destroy_border_identity(identity);
+        self.is_closing = true;
+        self.prepare_for_destroy();
     }
 
     /// # Safety
@@ -911,7 +959,7 @@ impl WindowBorder {
                 // doing so would prevent us from handling the transition back to a regular window.
                 if !self.should_show_border() {
                     self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
-                    self.drawer.destroy_anims_timer();
+                    self.stop_animation_clock();
 
                     return LRESULT(0);
                 }
@@ -953,7 +1001,7 @@ impl WindowBorder {
                     self.render().log_if_err();
                 }
 
-                self.drawer.set_anims_timer_if_needed(self.border_window.0);
+                self.start_animation_clock_if_needed();
             }
             // EVENT_OBJECT_REORDER
             WM_APP_REORDER => {
@@ -1068,7 +1116,7 @@ impl WindowBorder {
                     self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
                     self.render().log_if_err();
 
-                    self.drawer.set_anims_timer_if_needed(self.border_window.0);
+                    self.start_animation_clock_if_needed();
                 }
 
                 self.is_paused = false;
@@ -1080,7 +1128,7 @@ impl WindowBorder {
                     return LRESULT(0);
                 }
                 self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
-                self.drawer.destroy_anims_timer();
+                self.stop_animation_clock();
                 self.is_paused = true;
             }
             // EVENT_OBJECT_MINIMIZESTART
@@ -1095,7 +1143,7 @@ impl WindowBorder {
                 self.drawer.active_color.set_opacity(0.0).log_if_err();
                 self.drawer.inactive_color.set_opacity(0.0).log_if_err();
 
-                self.drawer.destroy_anims_timer();
+                self.stop_animation_clock();
                 self.is_paused = true;
             }
             // EVENT_SYSTEM_MINIMIZEEND
@@ -1124,14 +1172,6 @@ impl WindowBorder {
                         )
                     };
                 }
-            }
-            WM_APP_ANIMATE => {
-                if self.is_paused {
-                    return LRESULT(0);
-                }
-
-                let bounds = self.compute_border_bounds();
-                self.drawer.animate(bounds, self.window_state).log_if_err();
             }
             WM_APP_KOMOREBI => {
                 let window_rule = get_window_rule(self.tracking_window);
@@ -1322,7 +1362,7 @@ impl WindowBorder {
             WM_POWERBROADCAST => match wparam.0 as u32 {
                 PBT_APMSUSPEND => {
                     debug!("system is suspending; uninitializing border drawer");
-                    self.drawer.destroy_anims_timer();
+                    self.stop_animation_clock();
                     self.drawer.uninit();
                 }
                 PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC

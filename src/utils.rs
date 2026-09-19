@@ -6,7 +6,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::{fs, ptr, thread, time};
+use std::{fs, ptr};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ENVVAR_NOT_FOUND, ERROR_INVALID_WINDOW_HANDLE, ERROR_SUCCESS, GetLastError,
     HANDLE, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM,
@@ -36,10 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HRESULT, PWSTR};
 
 use crate::APP_STATE;
-use crate::border_registry::WindowIdentity;
-use crate::border_runtime::{request_create_border, request_destroy_border};
+use crate::border_runtime::{request_create_border, request_destroy_border_identity};
 use crate::config::{EnableMode, MatchKind, MatchStrategy, WindowRule};
-use crate::event_hook::handle_foreground_event;
 
 pub const WM_APP_LOCATIONCHANGE: u32 = WM_APP;
 pub const WM_APP_REORDER: u32 = WM_APP + 1;
@@ -48,7 +46,6 @@ pub const WM_APP_SHOWUNCLOAKED: u32 = WM_APP + 3;
 pub const WM_APP_HIDECLOAKED: u32 = WM_APP + 4;
 pub const WM_APP_MINIMIZESTART: u32 = WM_APP + 5;
 pub const WM_APP_MINIMIZEEND: u32 = WM_APP + 6;
-pub const WM_APP_ANIMATE: u32 = WM_APP + 7;
 pub const WM_APP_KOMOREBI: u32 = WM_APP + 8;
 pub const WM_APP_RECREATE_DRAWER: u32 = WM_APP + 9;
 pub const WM_APP_SET_COLORS: u32 = WM_APP + 10;
@@ -771,7 +768,7 @@ pub fn destroy_border_for_window(tracking_window: HWND) {
         return;
     }
 
-    let _ = request_destroy_border(identity);
+    request_destroy_border_identity(identity);
 }
 
 pub fn get_border_for_window(hwnd: HWND) -> Option<HWND> {
@@ -803,38 +800,6 @@ pub fn hide_border_for_window(hwnd: HWND) {
             .context("hide_border_for_window")
             .log_if_err();
     }
-}
-
-/// Spawns a thread that polls to make up for unreliable events (e.g. EVENT_SYSTEM_FOREGROUND).
-pub fn spawn_window_state_poller() {
-    const POLL_DELAY: u64 = 100;
-
-    let _ = thread::spawn(move || {
-        loop {
-            // Handle any changes in terms of which window is foreground/active
-            let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
-            let new_active_hwnd = get_foreground_window();
-            if new_active_hwnd != old_active_hwnd && !new_active_hwnd.is_invalid() {
-                handle_foreground_event(new_active_hwnd, old_active_hwnd);
-            }
-
-            // Reap stale identities, not merely invalid HWND values. Windows can reuse an HWND.
-            let stale_identities: Vec<WindowIdentity> = APP_STATE
-                .border_registry
-                .read()
-                .unwrap()
-                .records()
-                .into_iter()
-                .filter(|record| !record.tracking.still_matches())
-                .map(|record| record.tracking)
-                .collect();
-            for identity in stale_identities {
-                let _ = request_destroy_border(identity);
-            }
-
-            thread::sleep(time::Duration::from_millis(POLL_DELAY));
-        }
-    });
 }
 
 pub fn get_last_error() -> WIN32_ERROR {
