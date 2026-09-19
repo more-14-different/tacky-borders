@@ -255,7 +255,7 @@ fn process_command(raw: &str) -> String {
                 let isize = *APP_STATE.active_window.lock().unwrap();
                 format!("{isize:#x}") // format as hex
             };
-            let border_count = APP_STATE.borders.lock().unwrap().len();
+            let border_count = APP_STATE.border_registry.read().unwrap().len();
 
             json!({
                 "ok": true,
@@ -279,13 +279,7 @@ fn broadcast_payload<T: IpcPayload>(payload: &T, focused_only: bool) {
             .map(|hwnd| vec![hwnd])
             .unwrap_or_default()
     } else {
-        APP_STATE
-            .borders
-            .lock()
-            .unwrap()
-            .values()
-            .map(|hwnd_isize| HWND(*hwnd_isize as _))
-            .collect()
+        APP_STATE.border_registry.read().unwrap().border_hwnds()
     };
 
     // Each border window gets its own heap-allocated payload so that ownership

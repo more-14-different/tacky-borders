@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
 use std::sync::LazyLock;
+use tacky_borders::border_runtime::BorderRuntimeHost;
 use tacky_borders::colors::ColorBrushConfig;
 use tacky_borders::config::{OffsetConfig, RadiusConfig, WidthConfig};
 use tacky_borders::iocp::UnixStream;
@@ -70,6 +71,16 @@ fn run_daemon() {
         .context("could not make process dpi aware")
         .log_if_err();
 
+    register_border_window_class().log_if_err();
+    let _border_runtime = match BorderRuntimeHost::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            error!("could not initialize border runtime: {err:#}");
+            return;
+        }
+    };
+
+    // Install the hook only after the runtime is ready; SHOW/DESTROY events can arrive immediately.
     let hwineventhook = set_event_hook();
 
     // This owns the tray icon window, so it must be kept in scope
@@ -78,7 +89,6 @@ fn run_daemon() {
         error!("could not create tray icon: {err:#}");
     }
 
-    register_border_window_class().log_if_err();
     create_borders_for_existing_windows().log_if_err();
     spawn_window_state_poller();
 

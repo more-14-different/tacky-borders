@@ -7,6 +7,8 @@ pub mod animations;
 pub mod auto_start;
 pub mod border_config;
 pub mod border_drawer;
+pub mod border_registry;
+pub mod border_runtime;
 pub mod colors;
 pub mod config;
 pub mod effects;
@@ -21,12 +23,13 @@ pub mod utils;
 pub mod window_border;
 
 use anyhow::{Context, anyhow};
+use border_registry::BorderRegistry;
+use border_runtime::request_destroy_all_borders;
 use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback};
 use ipc::IpcServer;
 use komorebi::KomorebiIntegration;
 use render_backend::RenderBackendConfig;
 use sp_log::{ColorChoice, CombinedLogger, FileLogger, LevelFilter, TermLogger, TerminalMode};
-use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
@@ -34,7 +37,7 @@ use utils::{
     LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WM_APP_RECREATE_DRAWER,
     WindowsCompatibleResult, WindowsContext, create_border_for_window, get_foreground_window,
     get_last_error, get_window_rule, has_filtered_style, is_window_cloaked, is_window_top_level,
-    is_window_visible, post_message_w, send_notify_message_w,
+    is_window_visible, post_message_w,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
@@ -60,15 +63,14 @@ use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, INFINITE, OpenThread, SetEvent, THREAD_SYNCHRONIZE,
-    WaitForMultipleObjects,
+    CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_MAX, EVENT_MIN, EnumWindows, GetWindowThreadProcessId, IDC_ARROW, IDNO, LoadCursorW,
-    MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
-    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW, RegisterClassExW, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_NCDESTROY, WNDCLASSEXW,
+    EVENT_MAX, EVENT_MIN, EnumWindows, IDC_ARROW, IDNO, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE, MessageBoxW, RegisterClassExW, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WNDCLASSEXW,
 };
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
@@ -93,7 +95,7 @@ pub static BG_SERVICES: LazyLock<Mutex<BackgroundServices>> =
     LazyLock::new(|| Mutex::new(BackgroundServices::new(&APP_STATE.config.read().unwrap())));
 
 pub struct AppState {
-    borders: Mutex<HashMap<isize, isize>>,
+    pub(crate) border_registry: RwLock<BorderRegistry>,
     initial_windows: Mutex<Vec<isize>>,
     active_window: Mutex<isize>,
     config: RwLock<Config>,
@@ -141,7 +143,7 @@ impl AppState {
         };
 
         AppState {
-            borders: Mutex::new(HashMap::new()),
+            border_registry: RwLock::new(BorderRegistry::default()),
             initial_windows: Mutex::new(Vec::new()),
             active_window: Mutex::new(active_window),
             config: RwLock::new(config),
@@ -354,8 +356,8 @@ impl DisplayAdaptersWatcher {
                     break;
                 }
 
-                for hwnd_isize in APP_STATE.borders.lock().unwrap().values() {
-                    let border_hwnd = HWND(*hwnd_isize as _);
+                let border_hwnds = APP_STATE.border_registry.read().unwrap().border_hwnds();
+                for border_hwnd in border_hwnds {
                     post_message_w(
                         Some(border_hwnd),
                         WM_APP_RECREATE_DRAWER,
@@ -595,73 +597,8 @@ pub fn create_borders_for_existing_windows() -> WindowsCompatibleResult<()> {
 }
 
 pub fn destroy_borders() {
-    // Copy the hashmap's values to prevent mutex deadlocks
-    let border_hwnds: Vec<HWND> = APP_STATE
-        .borders
-        .lock()
-        .unwrap()
-        .values()
-        .map(|hwnd_isize| HWND(*hwnd_isize as _))
-        .collect();
-
-    let thread_ids: HashSet<u32> = border_hwnds
-        .iter()
-        .filter_map(|hwnd| {
-            let thread_id = unsafe { GetWindowThreadProcessId(*hwnd, None) };
-            if thread_id != 0 {
-                Some(thread_id)
-            } else {
-                error!(
-                    "could not get thread id from {:?}: {:?}",
-                    hwnd,
-                    get_last_error()
-                );
-                None
-            }
-        })
-        .collect();
-
-    let thread_handles: Vec<HANDLE> = thread_ids
-        .into_iter()
-        .filter_map(
-            |thread_id| match unsafe { OpenThread(THREAD_SYNCHRONIZE, false, thread_id) } {
-                Ok(handle) => Some(handle),
-                Err(err) => {
-                    error!("could not get thread handle from thread id {thread_id}: {err:#}");
-                    None
-                }
-            },
-        )
-        .collect();
-
-    // Tell the border windows to destroy themselves
-    for hwnd in border_hwnds.into_iter() {
-        send_notify_message_w(hwnd, WM_NCDESTROY, WPARAM::default(), LPARAM::default())
-            .with_context(|| format!("could not send notify WM_NCDESTROY to {hwnd:?}"))
-            .log_if_err();
-    }
-
-    let timeout_ms = 1000;
-    let wait_event = unsafe { WaitForMultipleObjects(&thread_handles, true, timeout_ms) };
-
-    let wait_object_start = WAIT_OBJECT_0.0;
-    let wait_object_end = WAIT_OBJECT_0.0 + (thread_handles.len() as u32);
-    let wait_object_range = wait_object_start..wait_object_end;
-
-    // If thread_handles is empty, WaitForMultipleObjects returns WAIT_FAILED since there's nothing
-    // to wait on. This is expected and safely ignored by the is_empty() check below.
-    if !thread_handles.is_empty() && !wait_object_range.contains(&wait_event.0) {
-        error!(
-            "failed to wait for all border threads to exit: {:?}",
-            get_last_error()
-        );
-    }
-
-    // Convert HANDLEs to OwnedHANDLEs so they automatically close when dropped
-    let _owned_handles: Vec<OwnedHANDLE> = thread_handles.into_iter().map(OwnedHANDLE).collect();
-
-    // NOTE: we will rely on each border thread to remove themselves from the hashmap, so we won't
-    // do any manual cleanup here
+    // BorderRuntime owns every WindowBorder and destroys each HWND on its creator UI thread.
+    request_destroy_all_borders();
 }
 
 pub fn reload_borders() {
@@ -751,7 +688,7 @@ unsafe extern "system" fn create_borders_callback(_hwnd: HWND, _lparam: LPARAM) 
             } else if window_rule.enabled == Some(EnableMode::Bool(true))
                 || !has_filtered_style(_hwnd)
             {
-                create_border_for_window(_hwnd, window_rule);
+                create_border_for_window(_hwnd);
             }
         }
 

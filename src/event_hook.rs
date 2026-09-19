@@ -48,9 +48,9 @@ pub extern "system" fn process_win_event(
                 return;
             }
 
-            // Send reorder messages to all the border windows
-            for value in APP_STATE.borders.lock().unwrap().values() {
-                let border_window = HWND(*value as _);
+            // Reorder still fans out in phase 1, but dispatch uses a stable registry snapshot.
+            let border_windows = APP_STATE.border_registry.read().unwrap().border_hwnds();
+            for border_window in border_windows {
                 if is_window_visible(border_window) {
                     post_message_w(Some(border_window), WM_APP_REORDER, WPARAM(0), LPARAM(0))
                         .context("EVENT_OBJECT_REORDER")
@@ -104,17 +104,20 @@ pub fn handle_foreground_event(best_hwnd_guess: HWND, other_hwnd_guess: HWND) {
         true => best_hwnd_guess,
         false => other_hwnd_guess,
     };
+    let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
     *APP_STATE.active_window.lock().unwrap() = new_active_hwnd.0 as isize;
 
-    // Send foreground messages to all the border windows
-    // TODO: I think only the previous focused and new focused actually need the message
-    for (key, val) in APP_STATE.borders.lock().unwrap().iter() {
-        let border_window = HWND(*val as _);
-        // Some apps can become foreground even if they're not visible, so we also have to check
-        // the keys against the active_window HWND from earlier
-        if is_window_visible(border_window) || *key == new_active_hwnd.0 as isize {
+    // Only the old and new focused windows can change active/inactive appearance.
+    for tracking_window in [old_active_hwnd, new_active_hwnd] {
+        if tracking_window.is_invalid() {
+            continue;
+        }
+        if tracking_window == old_active_hwnd && old_active_hwnd == new_active_hwnd {
+            continue;
+        }
+        if let Some(border_window) = get_border_for_window(tracking_window) {
             post_message_w(Some(border_window), WM_APP_FOREGROUND, WPARAM(0), LPARAM(0))
-                .context("EVENT_OBJECT_FOCUS")
+                .context("EVENT_SYSTEM_FOREGROUND")
                 .log_if_err();
         }
     }

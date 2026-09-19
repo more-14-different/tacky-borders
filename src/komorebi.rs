@@ -257,9 +257,11 @@ impl KomorebiIntegration {
 
         let new_focus_state = focus_state_mutex.lock().unwrap();
 
-        for (tracking, border) in APP_STATE.borders.lock().unwrap().iter() {
-            let previous_window_kind = previous_focus_state.get(tracking);
-            let new_window_kind = new_focus_state.get(tracking);
+        let border_records = APP_STATE.border_registry.read().unwrap().records();
+        for record in border_records {
+            let tracking = record.tracking.hwnd;
+            let previous_window_kind = previous_focus_state.get(&tracking);
+            let new_window_kind = new_focus_state.get(&tracking);
 
             // Only post update messages when the window kind has actually changed
             if previous_window_kind != new_window_kind {
@@ -275,7 +277,7 @@ impl KomorebiIntegration {
                     continue;
                 }
 
-                let border_hwnd = HWND(*border as _);
+                let border_hwnd = record.border_hwnd();
                 post_message_w(Some(border_hwnd), WM_APP_KOMOREBI, WPARAM(0), LPARAM(0))
                     .context("WM_APP_KOMOREBI")
                     .log_if_err();

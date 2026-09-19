@@ -28,18 +28,18 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetMessageW,
-    GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged,
-    IsWindowVisible, MSG, PostMessageW, RealGetWindowClassW, SendMessageW, SendNotifyMessageW,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_NCDESTROY, WS_CHILD,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged, IsWindowVisible, PostMessageW,
+    RealGetWindowClassW, SendMessageW, SendNotifyMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
 };
 use windows::core::{BOOL, HRESULT, PWSTR};
 
 use crate::APP_STATE;
+use crate::border_registry::WindowIdentity;
+use crate::border_runtime::{request_create_border, request_destroy_border};
 use crate::config::{EnableMode, MatchKind, MatchStrategy, WindowRule};
 use crate::event_hook::handle_foreground_event;
-use crate::window_border::WindowBorder;
 
 pub const WM_APP_LOCATIONCHANGE: u32 = WM_APP;
 pub const WM_APP_REORDER: u32 = WM_APP + 1;
@@ -680,61 +680,8 @@ pub fn has_native_border(hwnd: HWND) -> bool {
     !style.contains(WS_MAXIMIZE) && ex_style.contains(WS_EX_WINDOWEDGE)
 }
 
-pub fn create_border_for_window(tracking_window: HWND, window_rule: WindowRule) {
-    let tracking_window_isize = tracking_window.0 as isize;
-
-    let _ = thread::spawn(move || {
-        let tracking_window = HWND(tracking_window_isize as _);
-
-        // Note: 'key' for the hashmap is the tracking window, 'value' is the border window
-        let mut borders_hashmap = APP_STATE.borders.lock().unwrap();
-
-        // Check to see if there is already a border for the given tracking window
-        if borders_hashmap.contains_key(&tracking_window_isize) {
-            return;
-        }
-
-        debug!("creating border for: {tracking_window:?}");
-
-        // Otherwise, continue creating the border window
-        let mut border = match WindowBorder::new(tracking_window) {
-            Ok(border) => border,
-            Err(err) => {
-                error!("could not create window border for {tracking_window:?}: {err:#}");
-                return;
-            }
-        };
-
-        borders_hashmap.insert(tracking_window_isize, border.border_window.0.0 as isize);
-        drop(borders_hashmap);
-
-        // Drop these values (to save some RAM?) before calling init and entering a message loop
-        let _ = tracking_window;
-        let _ = tracking_window_isize;
-
-        if let Err(err) = border.init(window_rule) {
-            error!("could not initialize border: {err:#}");
-        } else {
-            // Window message loop
-            unsafe {
-                let mut message = MSG::default();
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
-        };
-
-        // If the above loop exits, that means the border has been destroyed, so we should remove
-        // it from the hashmap
-        APP_STATE
-            .borders
-            .lock()
-            .unwrap()
-            .remove(&tracking_window_isize);
-
-        debug!("exiting border thread for {:?}!", border.tracking_window);
-    });
+pub fn create_border_for_window(tracking_window: HWND) {
+    request_create_border(tracking_window);
 }
 
 pub fn get_adjusted_radius(radius: f32, dpi: u32, border_width: i32) -> f32 {
@@ -806,32 +753,29 @@ pub fn get_monitor_info(hmonitor: HMONITOR) -> windows::core::Result<MONITORINFO
 }
 
 pub fn destroy_border_for_window(tracking_window: HWND) {
-    if let Some(&border_isize) = APP_STATE
-        .borders
-        .lock()
+    let identity = APP_STATE
+        .border_registry
+        .read()
         .unwrap()
-        .get(&(tracking_window.0 as isize))
-    {
-        let border_window = HWND(border_isize as _);
+        .get(tracking_window)
+        .map(|record| record.tracking);
 
-        send_notify_message_w(border_window, WM_NCDESTROY, WPARAM(0), LPARAM(0))
-            .context("destroy_border_for_window")
-            .log_if_err();
+    let Some(identity) = identity else {
+        return;
+    };
+
+    // WinEvent delivery is asynchronous. If this numeric HWND has already been reused and the
+    // registry describes the live replacement, a delayed DESTROY must not remove the new border.
+    // A real destroy that is still observable as live will be caught by the identity reaper.
+    if identity.still_matches() {
+        return;
     }
+
+    let _ = request_destroy_border(identity);
 }
 
 pub fn get_border_for_window(hwnd: HWND) -> Option<HWND> {
-    let borders_hashmap = APP_STATE.borders.lock().unwrap();
-
-    let hwnd_isize = hwnd.0 as isize;
-    let Some(border_isize) = borders_hashmap.get(&hwnd_isize) else {
-        drop(borders_hashmap);
-        return None;
-    };
-
-    let border_window: HWND = HWND(*border_isize as _);
-
-    Some(border_window)
+    APP_STATE.border_registry.read().unwrap().get_border(hwnd)
 }
 
 pub fn show_border_for_window(hwnd: HWND) {
@@ -847,25 +791,18 @@ pub fn show_border_for_window(hwnd: HWND) {
         if window_rule.enabled == Some(EnableMode::Bool(false)) {
             info!("border is disabled for {hwnd:?}");
         } else if window_rule.enabled == Some(EnableMode::Bool(true)) || !has_filtered_style(hwnd) {
-            create_border_for_window(hwnd, window_rule);
+            create_border_for_window(hwnd);
         }
     }
 }
 
 pub fn hide_border_for_window(hwnd: HWND) {
-    let hwnd_isize = hwnd.0 as isize;
-
-    // Spawn a new thread to guard against re-entrancy in the event hook, though it honestly isn't
-    // that important for our purposes I think
-    let _ = thread::spawn(move || {
-        let hwnd = HWND(hwnd_isize as _);
-
-        if let Some(border) = get_border_for_window(hwnd) {
-            post_message_w(Some(border), WM_APP_HIDECLOAKED, WPARAM(0), LPARAM(0))
-                .context("hide_border_for_window")
-                .log_if_err();
-        }
-    });
+    // PostMessage is already asynchronous; an extra short-lived thread only adds churn.
+    if let Some(border) = get_border_for_window(hwnd) {
+        post_message_w(Some(border), WM_APP_HIDECLOAKED, WPARAM(0), LPARAM(0))
+            .context("hide_border_for_window")
+            .log_if_err();
+    }
 }
 
 /// Spawns a thread that polls to make up for unreliable events (e.g. EVENT_SYSTEM_FOREGROUND).
@@ -881,17 +818,18 @@ pub fn spawn_window_state_poller() {
                 handle_foreground_event(new_active_hwnd, old_active_hwnd);
             }
 
-            // Reap borders for windows that no longer exist
-            let invalid_hwnds: Vec<HWND> = APP_STATE
-                .borders
-                .lock()
+            // Reap stale identities, not merely invalid HWND values. Windows can reuse an HWND.
+            let stale_identities: Vec<WindowIdentity> = APP_STATE
+                .border_registry
+                .read()
                 .unwrap()
-                .keys()
-                .map(|tracking_isize| HWND(*tracking_isize as _))
-                .filter(|tracking_hwnd| !is_window(Some(*tracking_hwnd)))
+                .records()
+                .into_iter()
+                .filter(|record| !record.tracking.still_matches())
+                .map(|record| record.tracking)
                 .collect();
-            for hwnd in invalid_hwnds {
-                destroy_border_for_window(hwnd);
+            for identity in stale_identities {
+                let _ = request_destroy_border(identity);
             }
 
             thread::sleep(time::Duration::from_millis(POLL_DELAY));
