@@ -2,7 +2,7 @@ use anyhow::{Context, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::{
-    LazyLock, RwLock,
+    LazyLock, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
     mpsc::{SyncSender, sync_channel},
 };
@@ -33,14 +33,18 @@ const ANIMATION_TIMER_ID: usize = 1;
 const FOREGROUND_POLL_TIMER_ID: usize = 2;
 const RECONCILE_TIMER_ID: usize = 3;
 const REORDER_TIMER_ID: usize = 4;
+const LOCATION_TIMER_ID: usize = 5;
 const FOREGROUND_POLL_INTERVAL_MS: u32 = 100;
 const RECONCILE_INTERVAL_MS: u32 = 1000;
 const MIN_ANIMATION_TIMER_INTERVAL_MS: u32 = 10;
 const REORDER_DEBOUNCE_INTERVAL_MS: u64 = 16;
+const LOCATION_COALESCE_INTERVAL_MS: u64 = 16;
 
 static RUNTIME_HANDLE: LazyLock<RwLock<Option<BorderRuntimeHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 static REORDER_COMMAND_PENDING: AtomicBool = AtomicBool::new(false);
+static LOCATION_COMMAND_GATE: LazyLock<Mutex<IdentityCommandGate>> =
+    LazyLock::new(|| Mutex::new(IdentityCommandGate::default()));
 
 #[derive(Debug, Clone, Copy)]
 pub struct BorderRuntimeHandle {
@@ -190,11 +194,83 @@ impl ReorderCoalescer {
 }
 
 #[derive(Debug, Default)]
+struct IdentityCommandGate {
+    pending: HashSet<WindowIdentity>,
+}
+
+impl IdentityCommandGate {
+    fn acquire(&mut self, identity: WindowIdentity) -> bool {
+        self.pending.insert(identity)
+    }
+
+    fn release(&mut self, identity: WindowIdentity) {
+        self.pending.remove(&identity);
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocationAction {
+    FlushNow,
+    ArmTimer(Duration),
+    Coalesced,
+}
+
+#[derive(Debug, Default)]
+struct LocationCoalescer {
+    last_flush: Option<Instant>,
+    timer_armed: bool,
+    dirty: HashSet<WindowIdentity>,
+}
+
+impl LocationCoalescer {
+    fn on_event(&mut self, identity: WindowIdentity, now: Instant) -> LocationAction {
+        if self.timer_armed {
+            self.dirty.insert(identity);
+            return LocationAction::Coalesced;
+        }
+
+        if let Some(last_flush) = self.last_flush {
+            let interval = Duration::from_millis(LOCATION_COALESCE_INTERVAL_MS);
+            let elapsed = now.saturating_duration_since(last_flush);
+            if elapsed < interval {
+                self.dirty.insert(identity);
+                self.timer_armed = true;
+                return LocationAction::ArmTimer(interval - elapsed);
+            }
+        }
+
+        self.last_flush = Some(now);
+        LocationAction::FlushNow
+    }
+
+    fn on_timer(&mut self, now: Instant) -> Vec<WindowIdentity> {
+        self.timer_armed = false;
+        if self.dirty.is_empty() {
+            return Vec::new();
+        }
+
+        self.last_flush = Some(now);
+        let mut dirty: Vec<WindowIdentity> = self.dirty.drain().collect();
+        dirty.sort_by_key(|identity| (identity.hwnd, identity.process_id, identity.thread_id));
+        dirty
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug, Default)]
 struct BorderRuntime {
     registry: BorderRegistry,
     active_window: isize,
     current_process_elevated: bool,
     reorder: ReorderCoalescer,
+    location: LocationCoalescer,
     // Box keeps every WindowBorder at a stable address because the border HWND stores a pointer to
     // the WindowBorder in GWLP_USERDATA. Moving the Box in this map does not move the allocation.
     borders: HashMap<isize, Box<WindowBorder>>,
@@ -217,6 +293,7 @@ impl BorderRuntimeHost {
         let current_process_elevated = is_current_process_elevated()?;
         debug!("border runtime elevated: {current_process_elevated}");
         REORDER_COMMAND_PENDING.store(false, Ordering::Release);
+        LOCATION_COMMAND_GATE.lock().unwrap().clear();
 
         let mut runtime = Box::new(BorderRuntime {
             active_window: get_foreground_window().0 as isize,
@@ -342,6 +419,24 @@ pub fn request_window_event(tracking_window: HWND, event: BorderWindowEvent) {
     let Some(identity) = WindowIdentity::capture(tracking_window) else {
         return;
     };
+
+    if event == BorderWindowEvent::LocationChange {
+        // LOCATIONCHANGE can arrive much faster than the runtime can usefully redraw. Keep at most
+        // one queued command per full identity; the runtime holds this gate through any trailing
+        // coalescing interval so HWND reuse cannot merge unrelated windows.
+        if !LOCATION_COMMAND_GATE.lock().unwrap().acquire(identity) {
+            return;
+        }
+
+        if let Err(err) =
+            post_runtime_command(BorderRuntimeCommand::WindowEvent { identity, event })
+        {
+            LOCATION_COMMAND_GATE.lock().unwrap().release(identity);
+            error!("could not post location-change command to border runtime: {err:#}");
+        }
+        return;
+    }
+
     post_runtime_command_logged(BorderRuntimeCommand::WindowEvent { identity, event });
 }
 
@@ -455,7 +550,11 @@ impl BorderRuntime {
                 self.set_animation_registration(identity, fps)
             }
             BorderRuntimeCommand::WindowEvent { identity, event } => {
-                self.handle_window_event(identity, event)
+                if event == BorderWindowEvent::LocationChange {
+                    self.handle_location_request(identity);
+                } else {
+                    self.handle_window_event(identity, event);
+                }
             }
             BorderRuntimeCommand::Reorder => self.handle_reorder_request(),
             BorderRuntimeCommand::Foreground { tracking_hwnd } => {
@@ -473,6 +572,70 @@ impl BorderRuntime {
                 let _ = reply.send(self.snapshot());
             }
         }
+    }
+
+    fn handle_location_request(&mut self, identity: WindowIdentity) {
+        match self.location.on_event(identity, Instant::now()) {
+            LocationAction::FlushNow => {
+                LOCATION_COMMAND_GATE.lock().unwrap().release(identity);
+                self.handle_window_event(identity, BorderWindowEvent::LocationChange);
+            }
+            LocationAction::ArmTimer(delay) => self.arm_location_timer(delay),
+            LocationAction::Coalesced => {}
+        }
+    }
+
+    fn arm_location_timer(&mut self, delay: Duration) {
+        if self.dispatcher_hwnd == 0 {
+            self.location.reset();
+            LOCATION_COMMAND_GATE.lock().unwrap().clear();
+            return;
+        }
+
+        let delay_ms = delay.as_millis().clamp(1, u32::MAX as u128) as u32;
+        let timer = unsafe {
+            SetTimer(
+                Some(HWND(self.dispatcher_hwnd as _)),
+                LOCATION_TIMER_ID,
+                delay_ms,
+                None,
+            )
+        };
+        if timer == 0 {
+            error!("could not arm border runtime location timer; flushing immediately");
+            let pending = self.location.on_timer(Instant::now());
+            self.flush_location_identities(pending);
+        }
+    }
+
+    fn handle_location_timer(&mut self) {
+        if self.dispatcher_hwnd == 0 {
+            self.location.reset();
+            LOCATION_COMMAND_GATE.lock().unwrap().clear();
+            return;
+        }
+
+        unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), LOCATION_TIMER_ID) }.log_if_err();
+        let pending = self.location.on_timer(Instant::now());
+        self.flush_location_identities(pending);
+    }
+
+    fn flush_location_identities(&mut self, identities: Vec<WindowIdentity>) {
+        for identity in identities {
+            // Release before the direct call so a real move arriving during expensive rendering can
+            // queue one trailing update instead of being lost behind the current dispatch.
+            LOCATION_COMMAND_GATE.lock().unwrap().release(identity);
+            self.handle_window_event(identity, BorderWindowEvent::LocationChange);
+        }
+    }
+
+    fn reset_location_coalescing(&mut self) {
+        if self.dispatcher_hwnd != 0 {
+            unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), LOCATION_TIMER_ID) }
+                .log_if_err();
+        }
+        self.location.reset();
+        LOCATION_COMMAND_GATE.lock().unwrap().clear();
     }
 
     fn handle_window_event(&mut self, identity: WindowIdentity, event: BorderWindowEvent) {
@@ -689,6 +852,7 @@ impl BorderRuntime {
 
     fn handle_timer(&mut self, timer_id: usize) {
         match timer_id {
+            LOCATION_TIMER_ID => self.handle_location_timer(),
             REORDER_TIMER_ID => self.handle_reorder_timer(),
             ANIMATION_TIMER_ID => self.tick_animations(),
             FOREGROUND_POLL_TIMER_ID => self.reconcile_foreground(),
@@ -721,11 +885,14 @@ impl BorderRuntime {
         }
         let dispatcher = HWND(self.dispatcher_hwnd as _);
         unsafe {
+            KillTimer(Some(dispatcher), LOCATION_TIMER_ID).log_if_err();
             KillTimer(Some(dispatcher), REORDER_TIMER_ID).log_if_err();
             KillTimer(Some(dispatcher), ANIMATION_TIMER_ID).log_if_err();
             KillTimer(Some(dispatcher), FOREGROUND_POLL_TIMER_ID).log_if_err();
             KillTimer(Some(dispatcher), RECONCILE_TIMER_ID).log_if_err();
         }
+        self.location.reset();
+        LOCATION_COMMAND_GATE.lock().unwrap().clear();
         self.reorder.reset();
         REORDER_COMMAND_PENDING.store(false, Ordering::Release);
         self.animation_timer_interval_ms = None;
@@ -828,6 +995,8 @@ impl BorderRuntime {
     }
 
     fn destroy_all_borders(&mut self) {
+        self.reset_location_coalescing();
+
         if self.dispatcher_hwnd != 0 {
             unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), REORDER_TIMER_ID) }
                 .log_if_err();
@@ -1096,9 +1265,11 @@ unsafe extern "system" fn enum_windows_snapshot_callback(hwnd: HWND, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderRuntime, REORDER_DEBOUNCE_INTERVAL_MS, ReorderAction, ReorderCoalescer,
+        BorderRuntime, IdentityCommandGate, LOCATION_COALESCE_INTERVAL_MS, LocationAction,
+        LocationCoalescer, REORDER_DEBOUNCE_INTERVAL_MS, ReorderAction, ReorderCoalescer,
         animation_interval_ms, elevation_allows_border,
     };
+    use crate::border_registry::WindowIdentity;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1140,6 +1311,86 @@ mod tests {
         assert_eq!(
             coalescer.on_event(start + Duration::from_millis(REORDER_DEBOUNCE_INTERVAL_MS)),
             ReorderAction::FlushNow
+        );
+    }
+
+    fn test_identity(hwnd: isize, process_id: u32, thread_id: u32) -> WindowIdentity {
+        WindowIdentity {
+            hwnd,
+            process_id,
+            thread_id,
+        }
+    }
+
+    #[test]
+    fn location_gate_is_full_identity_aware() {
+        let old = test_identity(10, 100, 1000);
+        let new = test_identity(10, 200, 2000);
+        let mut gate = IdentityCommandGate::default();
+
+        assert!(gate.acquire(old));
+        assert!(!gate.acquire(old));
+        assert!(gate.acquire(new));
+        assert_eq!(gate.pending.len(), 2);
+
+        gate.release(old);
+        assert!(gate.acquire(old));
+    }
+
+    #[test]
+    fn location_coalescer_flushes_first_event_immediately() {
+        let start = Instant::now();
+        let identity = test_identity(10, 1, 2);
+        let mut coalescer = LocationCoalescer::default();
+        assert_eq!(
+            coalescer.on_event(identity, start),
+            LocationAction::FlushNow
+        );
+    }
+
+    #[test]
+    fn location_coalescer_batches_repeated_identity() {
+        let start = Instant::now();
+        let identity = test_identity(10, 1, 2);
+        let mut coalescer = LocationCoalescer::default();
+        assert_eq!(
+            coalescer.on_event(identity, start),
+            LocationAction::FlushNow
+        );
+        assert_eq!(
+            coalescer.on_event(identity, start + Duration::from_millis(5)),
+            LocationAction::ArmTimer(Duration::from_millis(11))
+        );
+        assert_eq!(
+            coalescer.on_event(identity, start + Duration::from_millis(6)),
+            LocationAction::Coalesced
+        );
+
+        assert_eq!(
+            coalescer.on_timer(start + Duration::from_millis(LOCATION_COALESCE_INTERVAL_MS)),
+            vec![identity]
+        );
+    }
+
+    #[test]
+    fn location_coalescer_keeps_reused_hwnd_identities_separate() {
+        let start = Instant::now();
+        let first = test_identity(10, 1, 2);
+        let replacement = test_identity(10, 7, 8);
+        let mut coalescer = LocationCoalescer::default();
+        assert_eq!(coalescer.on_event(first, start), LocationAction::FlushNow);
+        assert!(matches!(
+            coalescer.on_event(first, start + Duration::from_millis(1)),
+            LocationAction::ArmTimer(_)
+        ));
+        assert_eq!(
+            coalescer.on_event(replacement, start + Duration::from_millis(2)),
+            LocationAction::Coalesced
+        );
+
+        assert_eq!(
+            coalescer.on_timer(start + Duration::from_millis(LOCATION_COALESCE_INTERVAL_MS)),
+            vec![first, replacement]
         );
     }
 
