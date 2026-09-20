@@ -11,9 +11,13 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: "Commit SHA1 to build"
+        description: "Commit, branch, or tag to build"
         required: false
         default: "HEAD"
+      release_tag:
+        description: "Existing tag to publish/update; leave empty for build-only runs"
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,23 +25,28 @@ env:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      commit_sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
+      - name: Check out workflow-dispatch target
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          BUILD_TARGET: ${{ inputs.commit_sha }}
+        run: git checkout --detach $env:BUILD_TARGET
+
       - name: Build
-        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: cargo build --release
 
-      - name: Build workflow dispatch
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: |
-          git checkout ${{ github.event.inputs.commit_sha }}
-          cargo build --release
-
       - name: Get commit SHA of current build
-        run: echo "COMMIT_SHA=$(git rev-parse HEAD)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        id: commit
+        run: |
+          $sha = git rev-parse HEAD
+          "COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Upload a Build Artifact
         uses: actions/upload-artifact@v7
@@ -50,6 +59,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check out workflow-dispatch target
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          BUILD_TARGET: ${{ inputs.commit_sha }}
+        run: git checkout --detach $env:BUILD_TARGET
 
       - name: Run tests
         run: cargo test --verbose
@@ -57,23 +74,25 @@ jobs:
   release:
     needs: [build, test]
     runs-on: windows-latest
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
-          name: tacky-borders-${{ github.sha }}
+          name: tacky-borders-${{ needs.build.outputs.commit_sha }}
           path: ./artifacts/
 
       - name: Compress artifacts
         run: |
           $compress = @{
             Path = "./artifacts/tacky-borders.exe"
-            DestinationPath = "./artifacts/tacky-borders-${{ github.ref_name }}.zip"
+            DestinationPath = "./artifacts/tacky-borders-$env:RELEASE_TAG.zip"
           }
           Compress-Archive @compress
           Remove-Item -Path "./artifacts/tacky-borders.exe"
@@ -88,6 +107,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          body_path: .github/release-notes/${{ github.ref_name }}.md
+          tag_name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          make_latest: false
+          body_path: .github/release-notes/${{ env.RELEASE_TAG }}.md
           files: ./artifacts/*
