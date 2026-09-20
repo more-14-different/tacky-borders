@@ -3,11 +3,31 @@
 ![image](https://github.com/user-attachments/assets/37754479-2311-400e-b019-e0ad1db642a9)
 _tacky-borders_ lets you customize window borders on Windows 10 and 11.
 
+> [!IMPORTANT]
+> This repository is an independently maintained runtime-hardening fork of
+> [luke-you/tacky-borders](https://github.com/luke-you/tacky-borders). It currently preserves the
+> upstream configuration format and CLI while substantially restructuring runtime ownership,
+> event reconciliation, privilege filtering, and graphics failure recovery. Releases from this
+> repository are fork-specific and are not upstream releases.
+
+## Fork Status
+
+This fork focuses on long-running stability and a single-owner UI runtime. Its current changes
+include centralized border and graphics mutation, global animation scheduling, window lifecycle
+reconciliation, high-frequency event coalescing, elevated-window filtering, and hardened DirectX
+recovery with balanced RAII graphics guards.
+
+It is not currently branded as a separate product or a hard fork: compatibility with upstream is
+still intentional, and useful changes may still be upstreamed. The maintenance and release process
+for this branch is nevertheless independent. For the original project and its releases, see the
+[upstream repository](https://github.com/luke-you/tacky-borders).
+
 ## Installation
 
-### Pre-built Release
+### Pre-built Fork Release
 
-The easiest way to install _tacky-borders_ is to download a pre-built release from the [releases](https://github.com/luke-you/tacky-borders/releases) page.
+The easiest way to install this fork is to download a pre-built package from the
+[fork releases](https://github.com/more-14-different/tacky-borders/releases) page.
 
 When you run the .exe for the first time, _tacky-borders_ will automatically generate a config file for you in ```%userprofile%/.config/tacky-borders/```.
 
@@ -21,7 +41,7 @@ Alternatively, if you wish to build it yourself, you can follow these steps:
 2. Clone the repository:
 
    ```sh
-   git clone https://github.com/luke-you/tacky-borders.git
+   git clone https://github.com/more-14-different/tacky-borders.git
    ```
 
 3. Navigate to the project directory:

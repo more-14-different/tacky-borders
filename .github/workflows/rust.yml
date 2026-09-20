@@ -55,15 +55,18 @@ jobs:
         run: cargo test --verbose
 
   release:
-    needs: build
+    needs: [build, test]
     runs-on: windows-latest
     if: github.ref_type == 'tag'
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+
       - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
+          name: tacky-borders-${{ github.sha }}
           path: ./artifacts/
 
       - name: Compress artifacts
@@ -84,5 +87,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: .github/release-notes/${{ github.ref_name }}.md
           files: ./artifacts/*
