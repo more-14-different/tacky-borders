@@ -2,7 +2,10 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time;
 use windows::Win32::Foundation::HWND;
@@ -43,6 +46,8 @@ pub struct KomorebiIntegration {
     // NOTE: in komorebi it's <Border HWND, WindowKind>, but here it's <Tracking HWND, WindowKind>
     pub focus_state: Arc<Mutex<HashMap<isize, WindowKind>>>,
     _stream_sink: UnixStreamSink,
+    subscribe_stop: Arc<AtomicBool>,
+    subscribe_thread: Option<JoinHandle<()>>,
 }
 
 impl KomorebiIntegration {
@@ -67,12 +72,15 @@ impl KomorebiIntegration {
             Self::spawn_komorebi_notification_handler(focus_state_clone, &tacky_socket_path)
                 .context("could not spawn komorebi notification handler")?;
 
-        let _ = Self::spawn_komorebi_subscribe_thread(komorebi_socket_path)
-            .context("could not spawn komorebi subscribe thread")?;
+        let (subscribe_stop, subscribe_thread) =
+            Self::spawn_komorebi_subscribe_thread(komorebi_socket_path)
+                .context("could not spawn komorebi subscribe thread")?;
 
         Ok(Self {
             focus_state,
             _stream_sink: stream_sink,
+            subscribe_stop,
+            subscribe_thread: Some(subscribe_thread),
         })
     }
 
@@ -102,24 +110,31 @@ impl KomorebiIntegration {
 
     fn spawn_komorebi_subscribe_thread(
         komorebi_socket_path: PathBuf,
-    ) -> anyhow::Result<JoinHandle<()>> {
+    ) -> anyhow::Result<(Arc<AtomicBool>, JoinHandle<()>)> {
         let mut subscribe_message = {
             let enum_variant = SocketMessage::AddSubscriberSocket(Self::TACKY_SOCKET.to_string());
             serde_json::to_string(&enum_variant)?
         };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
 
         let join_handle = thread::spawn(move || {
             let subscribe_bytes = unsafe { subscribe_message.as_bytes_mut() };
 
-            while let Err(err) = write_to_unix_socket(&komorebi_socket_path, subscribe_bytes) {
-                // The write fails when komorebi isn't running which isn't a real issue, so we'll
-                // use debug instead of logging it as a full error
-                debug!("could not send subscribe-socket message to komorebi: {err:#}");
-                thread::sleep(Self::SUBSCRIBE_RETRY_INTERVAL);
+            while !stop_clone.load(Ordering::Acquire) {
+                match write_to_unix_socket(&komorebi_socket_path, subscribe_bytes) {
+                    Ok(()) => break,
+                    Err(err) => {
+                        // The write fails when komorebi isn't running which isn't a real issue, so
+                        // keep retrying until integration shutdown explicitly wakes this thread.
+                        debug!("could not send subscribe-socket message to komorebi: {err:#}");
+                        thread::park_timeout(Self::SUBSCRIBE_RETRY_INTERVAL);
+                    }
+                }
             }
         });
 
-        Ok(join_handle)
+        Ok((stop, join_handle))
     }
 
     fn get_komorebi_data_dir() -> anyhow::Result<PathBuf> {
@@ -281,5 +296,20 @@ impl KomorebiIntegration {
         // Runtime filters this list against its private registry, so komorebi never needs border
         // HWNDs or registry access of its own.
         request_komorebi_refresh(changed_tracking);
+    }
+}
+
+impl Drop for KomorebiIntegration {
+    fn drop(&mut self) {
+        self.subscribe_stop.store(true, Ordering::Release);
+        match self.subscribe_thread.take() {
+            Some(handle) => {
+                handle.thread().unpark();
+                if let Err(err) = handle.join() {
+                    error!("could not join komorebi subscribe thread: {err:?}");
+                }
+            }
+            None => error!("could not take komorebi subscribe thread handle"),
+        }
     }
 }

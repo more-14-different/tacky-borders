@@ -5,9 +5,9 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
 use crate::auto_start::{is_autostart_enabled, toggle_autostart};
-use crate::config::Config;
+use crate::config::{Config, request_config_reload};
 use crate::utils::LogIfErr;
-use crate::{BG_SERVICES, destroy_borders, reload_borders};
+use crate::{BG_SERVICES, destroy_borders};
 
 pub fn create_tray_icon(hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon> {
     let icon = match Icon::from_resource(1, Some((64, 64))) {
@@ -59,10 +59,7 @@ pub fn create_tray_icon(hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon
             }
         }
         // Reload
-        "2" => {
-            Config::reload();
-            reload_borders();
-        }
+        "2" => request_config_reload(),
         // Close
         "3" => {
             destroy_borders();

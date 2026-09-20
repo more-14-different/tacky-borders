@@ -14,18 +14,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
-fn pump_runtime_for(duration: time::Duration) {
-    let deadline = time::Instant::now() + duration;
-    while time::Instant::now() < deadline {
-        unsafe {
-            let mut message = MSG::default();
-            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
+fn pump_runtime_once() {
+    unsafe {
+        let mut message = MSG::default();
+        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
-        thread::sleep(time::Duration::from_millis(1));
     }
+    thread::sleep(time::Duration::from_millis(1));
 }
 
 fn runtime_snapshot() -> anyhow::Result<BorderRuntimeSnapshot> {
@@ -33,9 +30,26 @@ fn runtime_snapshot() -> anyhow::Result<BorderRuntimeSnapshot> {
     // issue the request from a worker while this thread continues pumping Win32 messages.
     let handle = thread::spawn(request_runtime_snapshot);
     while !handle.is_finished() {
-        pump_runtime_for(time::Duration::from_millis(5));
+        pump_runtime_once();
     }
     handle.join().expect("runtime snapshot worker panicked")
+}
+
+fn wait_for_border_count(expected: usize) -> anyhow::Result<BorderRuntimeSnapshot> {
+    let deadline = time::Instant::now() + time::Duration::from_secs(2);
+    loop {
+        let snapshot = runtime_snapshot()?;
+        if snapshot.border_count == expected {
+            return Ok(snapshot);
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for border_count={expected}; last count={}",
+                snapshot.border_count
+            );
+        }
+        pump_runtime_once();
+    }
 }
 
 #[test]
@@ -46,10 +60,8 @@ fn test_destroy_borders() -> anyhow::Result<()> {
 
     for _ in 0..5 {
         create_borders_for_existing_windows()?;
-        pump_runtime_for(time::Duration::from_millis(50));
-
         destroy_borders();
-        pump_runtime_for(time::Duration::from_millis(50));
+        wait_for_border_count(0)?;
 
         unsafe { EnumWindows(Some(enum_windows_tests_callback), LPARAM::default()) }?;
     }
@@ -64,14 +76,12 @@ fn test_reload_borders() -> anyhow::Result<()> {
     register_border_window_class()?;
     let _runtime = BorderRuntimeHost::new()?;
     create_borders_for_existing_windows()?;
-    pump_runtime_for(time::Duration::from_millis(50));
 
     for _ in 0..5 {
         reload_borders();
-        pump_runtime_for(time::Duration::from_millis(50));
     }
     destroy_borders();
-    pump_runtime_for(time::Duration::from_millis(50));
+    wait_for_border_count(0)?;
 
     unsafe { EnumWindows(Some(enum_windows_tests_callback), LPARAM::default()) }?;
 
@@ -85,12 +95,8 @@ fn test_runtime_snapshot_after_destroy() -> anyhow::Result<()> {
     let _runtime = BorderRuntimeHost::new()?;
 
     create_borders_for_existing_windows()?;
-    pump_runtime_for(time::Duration::from_millis(50));
-    let _before = runtime_snapshot()?;
-
     destroy_borders();
-    pump_runtime_for(time::Duration::from_millis(50));
-    assert_eq!(runtime_snapshot()?.border_count, 0);
+    assert_eq!(wait_for_border_count(0)?.border_count, 0);
 
     Ok(())
 }

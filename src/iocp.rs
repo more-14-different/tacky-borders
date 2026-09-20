@@ -7,9 +7,10 @@ use std::time;
 use std::{io, mem, ptr};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Networking::WinSock::{
-    ADDRESS_FAMILY, AF_UNIX, AcceptEx, INVALID_SOCKET, SEND_RECV_FLAGS, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOMAXCONN, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF,
-    WSARecv, WSASend, WSASocketW, accept, bind, closesocket, connect, listen, recv, send,
+    ADDRESS_FAMILY, AF_UNIX, AcceptEx, INVALID_SOCKET, SEND_RECV_FLAGS, SO_RCVTIMEO, SOCK_STREAM,
+    SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOL_SOCKET, SOMAXCONN, WSA_FLAG_OVERLAPPED,
+    WSA_IO_PENDING, WSABUF, WSARecv, WSASend, WSASocketW, accept, bind, closesocket, connect,
+    listen, recv, send, setsockopt,
 };
 use windows::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, GetQueuedCompletionStatusEx,
@@ -164,6 +165,19 @@ impl UnixStream {
                 flags: Box::new(0),
             },
         })
+    }
+
+    /// Sets a finite timeout for synchronous reads. IPC client workers use this only so daemon
+    /// shutdown can observe the shared stop flag even when a client keeps an idle socket open.
+    pub fn set_read_timeout(&self, timeout: time::Duration) -> io::Result<()> {
+        let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
+        let timeout_bytes = timeout_ms.to_ne_bytes();
+        let result =
+            unsafe { setsockopt(self.socket.0, SOL_SOCKET, SO_RCVTIMEO, Some(&timeout_bytes)) };
+        if result == SOCKET_ERROR {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// # Safety

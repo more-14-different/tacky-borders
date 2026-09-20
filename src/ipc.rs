@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use crate::border_runtime::{
     BorderRuntimeUpdate, request_apply_border_update, request_runtime_snapshot,
 };
 use crate::colors::ColorBrushConfig;
-use crate::config::{Config, OffsetConfig, RadiusConfig, WidthConfig};
+use crate::config::{Config, OffsetConfig, RadiusConfig, WidthConfig, request_config_reload};
 use crate::iocp::{UnixListener, UnixStream};
 use crate::utils::{LogIfErr, remove_file_if_exists};
 
@@ -52,7 +52,7 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
 
         // Unblock the accept() call in the server thread with a dummy connection
         let _ = UnixStream::connect(&self.socket_path);
@@ -75,25 +75,54 @@ impl Drop for IpcServer {
     }
 }
 
+const IPC_CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct ClientWorker {
+    handle: JoinHandle<()>,
+}
+
+fn reap_client_workers(workers: &mut Vec<ClientWorker>) {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].handle.is_finished() {
+            let worker = workers.swap_remove(index);
+            if let Err(err) = worker.handle.join() {
+                error!("ipc client worker panicked: {err:?}");
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
 fn run_server(listener: UnixListener, stop: Arc<AtomicBool>) {
     debug!("entering ipc server thread");
+    let mut client_workers = Vec::<ClientWorker>::new();
 
     loop {
         match listener.accept() {
             Ok(stream) => {
-                // The dummy connection sent by Drop should not be processed
-                if stop.load(Ordering::Relaxed) {
+                // The dummy connection sent by Drop should not be processed.
+                if stop.load(Ordering::Acquire) {
                     break;
                 }
 
-                thread::spawn(move || {
-                    if let Err(err) = handle_client(stream) {
+                reap_client_workers(&mut client_workers);
+                if let Err(err) = stream.set_read_timeout(IPC_CLIENT_READ_TIMEOUT) {
+                    error!("could not set ipc client read timeout: {err}");
+                    continue;
+                }
+
+                let client_stop = stop.clone();
+                let handle = thread::spawn(move || {
+                    if let Err(err) = handle_client(stream, client_stop) {
                         debug!("ipc client disconnected: {err:#}");
                     }
                 });
+                client_workers.push(ClientWorker { handle });
             }
             Err(err) => {
-                if !stop.load(Ordering::Relaxed) {
+                if !stop.load(Ordering::Acquire) {
                     error!("could not accept ipc client: {err}");
                 }
                 break;
@@ -101,25 +130,59 @@ fn run_server(listener: UnixListener, stop: Arc<AtomicBool>) {
         }
     }
 
+    // Also stop clients when the listener exits unexpectedly. Idle workers wake on SO_RCVTIMEO,
+    // observe this flag, and terminate before we join them below.
+    stop.store(true, Ordering::Release);
+    for worker in client_workers {
+        if let Err(err) = worker.handle.join() {
+            error!("ipc client worker panicked during shutdown: {err:?}");
+        }
+    }
+
     debug!("exiting ipc server thread");
 }
 
-fn handle_client(stream: UnixStream) -> anyhow::Result<()> {
-    let reader = BufReader::new(&stream);
+fn handle_client(stream: UnixStream, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
 
-    for line in reader.lines() {
-        let line = line.context("could not read line from ipc client")?;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err)
+                if err.kind() == io::ErrorKind::TimedOut
+                    || err.kind() == io::ErrorKind::WouldBlock =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err).context("could not read line from ipc client"),
+        }
+
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            line.clear();
             continue;
         }
 
-        let mut response = process_command(trimmed);
+        let mut reload_after_write = false;
+        let mut response = process_command(trimmed, &mut reload_after_write);
         response.push('\n');
 
         (&stream)
             .write_all(response.as_bytes())
             .context("could not write response to ipc client")?;
+
+        // Ack first. A config reload may disable the IPC server and join this worker; starting it
+        // only after the response has been written avoids racing the caller's acknowledgement.
+        if reload_after_write {
+            request_config_reload();
+        }
+        line.clear();
     }
 
     Ok(())
@@ -159,7 +222,7 @@ pub enum IpcCommand {
     GetState,
 }
 
-fn process_command(raw: &str) -> String {
+fn process_command(raw: &str, reload_after_write: &mut bool) -> String {
     let command: IpcCommand = match serde_json::from_str(raw) {
         Ok(command) => command,
         Err(err) => {
@@ -192,8 +255,7 @@ fn process_command(raw: &str) -> String {
             json!({"ok": true}).to_string()
         }
         IpcCommand::Reload => {
-            Config::reload();
-            crate::reload_borders();
+            *reload_after_write = true;
             json!({"ok": true}).to_string()
         }
         IpcCommand::GetState => {

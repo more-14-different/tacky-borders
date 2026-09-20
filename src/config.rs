@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+};
 use std::thread::JoinHandle;
 use std::{env, iter, ptr, slice, thread, time};
 use windows::Win32::Foundation::{HANDLE, HWND};
@@ -26,6 +30,135 @@ use windows::Win32::System::IO::CancelIoEx;
 use windows::core::PCWSTR;
 
 const DEFAULT_CONFIG: &str = include_str!("resources/config.yaml");
+
+const CONFIG_RELOAD_IDLE: u8 = 0;
+const CONFIG_RELOAD_PENDING: u8 = 1;
+const CONFIG_RELOAD_DIRTY: u8 = 2;
+static CONFIG_RELOAD_STATE: AtomicU8 = AtomicU8::new(CONFIG_RELOAD_IDLE);
+
+/// Requests a serialized config reload from a short-lived management worker. The worker is never
+/// the ConfigWatcher, tray, or IPC client thread, so reconfiguring BackgroundServices can safely
+/// stop and join any of those services without self-join or lock inversion.
+pub fn request_config_reload() {
+    if !mark_config_reload_requested(&CONFIG_RELOAD_STATE) {
+        return;
+    }
+
+    let spawn_result = thread::Builder::new()
+        .name("tacky-config-reload".to_string())
+        .spawn(run_config_reload_worker);
+    if let Err(err) = spawn_result {
+        CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+        error!("could not spawn config reload worker: {err}");
+    }
+}
+
+fn mark_config_reload_requested(state: &AtomicU8) -> bool {
+    loop {
+        match state.load(Ordering::Acquire) {
+            CONFIG_RELOAD_IDLE => {
+                if state
+                    .compare_exchange(
+                        CONFIG_RELOAD_IDLE,
+                        CONFIG_RELOAD_PENDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            CONFIG_RELOAD_PENDING => {
+                if state
+                    .compare_exchange(
+                        CONFIG_RELOAD_PENDING,
+                        CONFIG_RELOAD_DIRTY,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return false;
+                }
+            }
+            CONFIG_RELOAD_DIRTY => return false,
+            _ => unreachable!("invalid config reload state"),
+        }
+    }
+}
+
+/// Returns true when a request arrived during the previous pass and another pass must run.
+fn finish_config_reload_pass(state: &AtomicU8) -> bool {
+    loop {
+        match state.load(Ordering::Acquire) {
+            CONFIG_RELOAD_PENDING => {
+                if state
+                    .compare_exchange(
+                        CONFIG_RELOAD_PENDING,
+                        CONFIG_RELOAD_IDLE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return false;
+                }
+            }
+            CONFIG_RELOAD_DIRTY => {
+                if state
+                    .compare_exchange(
+                        CONFIG_RELOAD_DIRTY,
+                        CONFIG_RELOAD_PENDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            CONFIG_RELOAD_IDLE => return false,
+            _ => unreachable!("invalid config reload state"),
+        }
+    }
+}
+
+fn run_config_reload_worker() {
+    struct ResetReloadState {
+        armed: bool,
+    }
+    impl Drop for ResetReloadState {
+        fn drop(&mut self) {
+            if self.armed {
+                CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+            }
+        }
+    }
+    let mut reset = ResetReloadState { armed: true };
+
+    loop {
+        let old_config = (*APP_STATE.config.read().unwrap()).clone();
+        let reconfigure_services = Config::reload_with_status();
+        let new_config = (*APP_STATE.config.read().unwrap()).clone();
+
+        // Preserve the existing parse-error behavior: a malformed file may temporarily publish the
+        // default config, but it must not disable the watcher that is needed to observe the fix.
+        if reconfigure_services {
+            BG_SERVICES.lock().unwrap().reload(&new_config);
+        }
+
+        if old_config != new_config {
+            info!("config.yaml has changed; reloading borders");
+            reload_borders();
+        }
+
+        if !finish_config_reload_pass(&CONFIG_RELOAD_STATE) {
+            reset.armed = false;
+            break;
+        }
+    }
+}
 
 /// The config.yaml definition
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -339,24 +472,24 @@ impl Config {
         Ok(config_dir)
     }
 
-    pub fn reload() {
-        let new_config = match Self::create() {
-            Ok(config) => {
-                BG_SERVICES.lock().unwrap().reload(&config);
-                // DirectX device mutation is runtime-owned. reload_borders() will synchronize the
-                // device set after this config has been published.
-                config
-            }
+    fn reload_with_status() -> bool {
+        let (new_config, parsed_successfully) = match Self::create() {
+            Ok(config) => (config, true),
             Err(err) => {
                 error!("could not reload config: {err:#}");
                 thread::spawn(move || {
                     display_error_box(format!("could not reload config: {err:#}"), None);
                 });
 
-                Config::default()
+                (Config::default(), false)
             }
         };
         *APP_STATE.config.write().unwrap() = new_config;
+        parsed_successfully
+    }
+
+    pub fn reload() {
+        request_config_reload();
     }
 
     pub fn is_config_watcher_enabled(&self) -> bool {
@@ -399,6 +532,7 @@ impl Config {
 #[derive(Debug)]
 pub struct ConfigWatcher {
     dir_handle: OwnedHANDLE,
+    stop: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
 }
 
@@ -444,6 +578,8 @@ impl ConfigWatcher {
             .into_string()
             .map_err(|_| anyhow!("could not convert config name for config watcher"))?;
 
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
         let thread_handle = thread::spawn(move || unsafe {
             debug!("entering config watcher thread");
 
@@ -454,6 +590,10 @@ impl ConfigWatcher {
             let mut bytes_returned = 0u32;
 
             loop {
+                if stop_clone.load(Ordering::Acquire) {
+                    break;
+                }
+
                 if let Err(e) = ReadDirectoryChangesW(
                     dir_handle,
                     buffer.as_mut_ptr() as _,
@@ -464,16 +604,20 @@ impl ConfigWatcher {
                     None,
                     None,
                 ) {
-                    error!("could not check for changes in config dir: {e}");
+                    if !stop_clone.load(Ordering::Acquire) {
+                        error!("could not check for changes in config dir: {e}");
+                    }
                     break;
                 }
 
                 Self::process_dir_change_notifs(&buffer, bytes_returned, &config_name, callback_fn);
+                if stop_clone.load(Ordering::Acquire) {
+                    break;
+                }
 
-                // Prevent too many directory checks in quick succession
-                // NOTE: if any dir changes are made while the thread is asleep, the OS will hold
-                // the operations in queue, so we can immediately check them again after looping
-                thread::sleep(time::Duration::from_millis(debounce_time));
+                // park_timeout keeps the debounce interruptible during shutdown; Drop unparks this
+                // thread after setting stop so disabling watch_config_changes does not wait 500ms.
+                thread::park_timeout(time::Duration::from_millis(debounce_time));
             }
 
             debug!("exiting config watcher thread");
@@ -481,6 +625,7 @@ impl ConfigWatcher {
 
         Ok(Self {
             dir_handle,
+            stop,
             thread_handle: Some(thread_handle),
         })
     }
@@ -520,34 +665,61 @@ impl ConfigWatcher {
 
 impl Drop for ConfigWatcher {
     fn drop(&mut self) {
-        // Cancel all pending I/O operations on the handle. This should make the worker thread
-        // automatically exit.
-        let cancel_res = unsafe { CancelIoEx(self.dir_handle.0, None) };
+        self.stop.store(true, Ordering::Release);
 
-        match cancel_res {
-            Ok(()) => match self.thread_handle.take() {
-                Some(handle) => {
-                    if let Err(err) = handle.join() {
-                        error!("could not join config watcher thread handle: {err:?}");
-                    }
-                }
-                None => error!("could not take config watcher thread handle"),
-            },
-            Err(err) => error!(
-                "could not cancel i/o operations on {:?} for config watcher: {err:#}",
+        // If ReadDirectoryChangesW is blocked, CancelIoEx wakes it. If the worker is between reads
+        // (for example inside the debounce), the stop flag + unpark path handles shutdown instead.
+        if let Err(err) = unsafe { CancelIoEx(self.dir_handle.0, None) } {
+            debug!(
+                "could not cancel config watcher i/o on {:?}: {err:#}",
                 self.dir_handle.0
-            ),
+            );
+        }
+
+        match self.thread_handle.take() {
+            Some(handle) => {
+                handle.thread().unpark();
+                if let Err(err) = handle.join() {
+                    error!("could not join config watcher thread handle: {err:?}");
+                }
+            }
+            None => error!("could not take config watcher thread handle"),
         }
     }
 }
 
 pub fn config_watcher_callback() {
-    let old_config = (*APP_STATE.config.read().unwrap()).clone();
-    Config::reload();
-    let new_config = APP_STATE.config.read().unwrap();
+    // Never reload services on the watcher callback stack: the new config may disable this watcher
+    // and dropping it here would attempt to join the current thread.
+    request_config_reload();
+}
 
-    if old_config != *new_config {
-        info!("config.yaml has changed; reloading borders");
-        reload_borders();
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{
+        CONFIG_RELOAD_DIRTY, CONFIG_RELOAD_IDLE, CONFIG_RELOAD_PENDING, finish_config_reload_pass,
+        mark_config_reload_requested,
+    };
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[test]
+    fn config_reload_gate_coalesces_and_runs_one_trailing_pass() {
+        let state = AtomicU8::new(CONFIG_RELOAD_IDLE);
+        assert!(mark_config_reload_requested(&state));
+        assert_eq!(state.load(Ordering::Acquire), CONFIG_RELOAD_PENDING);
+        assert!(!mark_config_reload_requested(&state));
+        assert_eq!(state.load(Ordering::Acquire), CONFIG_RELOAD_DIRTY);
+        assert!(finish_config_reload_pass(&state));
+        assert_eq!(state.load(Ordering::Acquire), CONFIG_RELOAD_PENDING);
+        assert!(!finish_config_reload_pass(&state));
+        assert_eq!(state.load(Ordering::Acquire), CONFIG_RELOAD_IDLE);
+    }
+
+    #[test]
+    fn config_reload_gate_can_start_again_after_completion() {
+        let state = AtomicU8::new(CONFIG_RELOAD_IDLE);
+        assert!(mark_config_reload_requested(&state));
+        assert!(!finish_config_reload_pass(&state));
+        assert!(mark_config_reload_requested(&state));
     }
 }
