@@ -32,7 +32,8 @@ use crate::border_config::BorderConfig;
 use crate::border_drawer::BorderDrawer;
 use crate::border_registry::WindowIdentity;
 use crate::border_runtime::{
-    request_destroy_border_identity, request_mark_border_active, request_set_border_animation,
+    recover_directx_devices_for_render_error, request_destroy_border_identity,
+    request_graphics_refresh, request_mark_border_active, request_set_border_animation,
 };
 use crate::colors::ColorBrushConfig;
 use crate::config::{Offset, OffsetConfig, RadiusConfig, WidthConfig, WindowRule, ZOrderMode};
@@ -598,11 +599,11 @@ impl WindowBorder {
                 .context("handle_directx_errors")
                 .to_windows_result(T_E_REENTRANCY)?;
 
-            if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut() {
-                directx_devices
-                    .recreate_if_needed()
-                    .windows_context("could not recreate directx devices if needed")?;
-            }
+            recover_directx_devices_for_render_error()
+                .windows_context("could not recreate directx devices if needed")?;
+            // This border needs synchronous recovery for the immediate retry below. Queue one
+            // runtime-wide refresh as well so other borders can drop stale adapter references.
+            request_graphics_refresh();
             self.recreate_drawer_if_needed()
                 .windows_context("could not recreate border drawer if needed")?;
         } else if err.code() == T_E_UNINIT {
@@ -1214,18 +1215,9 @@ impl WindowBorder {
             // help detect adapter changes in specific scenarios (e.g. when a monitor is
             // connected/disconnected on an NVIDIA Optimus-supported laptop).
             WM_DEVICECHANGE if wparam.0 as u32 == DBT_DEVNODES_CHANGED => {
-                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut()
-                    && let Err(err) = directx_devices.recreate_if_needed()
-                {
-                    error!("could not recreate directx devices if needed: {err:#}");
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-                if let Err(err) = self.recreate_drawer_if_needed() {
-                    error!("could not recreate border drawer if needed: {err:#}");
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
+                // Every border can receive this broadcast. The runtime graphics gate collapses
+                // duplicates and performs device mutation + drawer refresh once on the UI thread.
+                request_graphics_refresh();
             }
             // This message should let us know when the system enters/leaves sleep/hibernation
             WM_POWERBROADCAST => match wparam.0 as u32 {

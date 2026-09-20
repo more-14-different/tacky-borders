@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::{
     LazyLock, Mutex, RwLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc::{SyncSender, sync_channel},
 };
 use std::time::{Duration, Instant};
@@ -21,12 +21,14 @@ use crate::border_registry::{
 };
 use crate::colors::ColorBrushConfig;
 use crate::config::{EnableMode, OffsetConfig, RadiusConfig, WidthConfig};
+use crate::render_backend::RenderBackendConfig;
 use crate::utils::{
-    LogIfErr, OwnedHWND, get_foreground_window, get_last_error, get_window_rule,
-    has_filtered_style, is_current_process_elevated, is_process_elevated, is_window_cloaked,
-    is_window_top_level, is_window_visible, post_message_w,
+    LogIfErr, OwnedHWND, WindowsCompatibleResult, get_foreground_window, get_last_error,
+    get_window_rule, has_filtered_style, is_current_process_elevated, is_process_elevated,
+    is_window_cloaked, is_window_top_level, is_window_visible, post_message_w,
 };
 use crate::window_border::WindowBorder;
+use crate::{APP_STATE, DirectXDevices};
 
 const WM_APP_RUNTIME_COMMAND: u32 = WM_APP + 100;
 const ANIMATION_TIMER_ID: usize = 1;
@@ -45,6 +47,10 @@ static RUNTIME_HANDLE: LazyLock<RwLock<Option<BorderRuntimeHandle>>> =
 static REORDER_COMMAND_PENDING: AtomicBool = AtomicBool::new(false);
 static LOCATION_COMMAND_GATE: LazyLock<Mutex<IdentityCommandGate>> =
     LazyLock::new(|| Mutex::new(IdentityCommandGate::default()));
+const GRAPHICS_REFRESH_IDLE: u8 = 0;
+const GRAPHICS_REFRESH_PENDING: u8 = 1;
+const GRAPHICS_REFRESH_DIRTY: u8 = 2;
+static GRAPHICS_REFRESH_STATE: AtomicU8 = AtomicU8::new(GRAPHICS_REFRESH_IDLE);
 
 #[derive(Debug, Clone, Copy)]
 pub struct BorderRuntimeHandle {
@@ -123,7 +129,8 @@ enum BorderRuntimeCommand {
     Foreground {
         tracking_hwnd: isize,
     },
-    RecreateDrawers,
+    RefreshGraphics,
+    ReloadBorders,
     KomorebiRefresh {
         tracking_hwnds: Vec<isize>,
     },
@@ -294,6 +301,7 @@ impl BorderRuntimeHost {
         debug!("border runtime elevated: {current_process_elevated}");
         REORDER_COMMAND_PENDING.store(false, Ordering::Release);
         LOCATION_COMMAND_GATE.lock().unwrap().clear();
+        GRAPHICS_REFRESH_STATE.store(GRAPHICS_REFRESH_IDLE, Ordering::Release);
 
         let mut runtime = Box::new(BorderRuntime {
             active_window: get_foreground_window().0 as isize,
@@ -468,8 +476,25 @@ pub fn request_foreground_change(best_hwnd_guess: HWND, other_hwnd_guess: HWND) 
     });
 }
 
-pub fn request_recreate_drawers() {
-    post_runtime_command_logged(BorderRuntimeCommand::RecreateDrawers);
+pub fn request_graphics_refresh() {
+    if !mark_graphics_refresh_requested(&GRAPHICS_REFRESH_STATE) {
+        return;
+    }
+
+    if let Err(err) = post_runtime_command(BorderRuntimeCommand::RefreshGraphics) {
+        GRAPHICS_REFRESH_STATE.store(GRAPHICS_REFRESH_IDLE, Ordering::Release);
+        error!("could not post graphics refresh command to border runtime: {err:#}");
+    }
+}
+
+pub fn request_reload_borders() {
+    post_runtime_command_logged(BorderRuntimeCommand::ReloadBorders);
+}
+
+/// Synchronous render-error recovery used by WindowBorder while already executing on the
+/// runtime/UI thread. All production DirectX-device mutation lives in this module.
+pub(crate) fn recover_directx_devices_for_render_error() -> WindowsCompatibleResult<()> {
+    sync_directx_devices_with_config()
 }
 
 pub fn request_komorebi_refresh(mut tracking_hwnds: Vec<isize>) {
@@ -560,7 +585,8 @@ impl BorderRuntime {
             BorderRuntimeCommand::Foreground { tracking_hwnd } => {
                 self.update_foreground(HWND(tracking_hwnd as _))
             }
-            BorderRuntimeCommand::RecreateDrawers => self.recreate_drawers(),
+            BorderRuntimeCommand::RefreshGraphics => self.handle_graphics_refresh(),
+            BorderRuntimeCommand::ReloadBorders => self.reload_borders(),
             BorderRuntimeCommand::KomorebiRefresh { tracking_hwnds } => {
                 self.refresh_komorebi(tracking_hwnds)
             }
@@ -792,6 +818,59 @@ impl BorderRuntime {
         }
     }
 
+    fn handle_graphics_refresh(&mut self) {
+        // Dirty requests observed before this command starts are consumed by this refresh. Requests
+        // arriving while the refresh is running promote the state back to DIRTY and schedule one
+        // trailing refresh after this pass completes.
+        begin_graphics_refresh(&GRAPHICS_REFRESH_STATE);
+
+        if let Err(err) = sync_directx_devices_with_config() {
+            error!("could not synchronize DirectX devices on runtime thread: {err:#}");
+        } else {
+            self.recreate_drawers();
+        }
+
+        if finish_graphics_refresh(&GRAPHICS_REFRESH_STATE) {
+            request_graphics_refresh();
+        }
+    }
+
+    fn reload_borders(&mut self) {
+        // Destroy old render resources before changing the shared device set. This avoids a window
+        // where old V2 borders are still live while config reload has already switched devices or
+        // disabled the V2 backend.
+        self.destroy_all_borders();
+        APP_STATE.initial_windows.lock().unwrap().clear();
+
+        if let Err(err) = sync_directx_devices_with_config() {
+            error!("could not synchronize DirectX devices while reloading borders: {err:#}");
+            return;
+        }
+
+        let snapshot = match WindowSnapshot::collect(self.current_process_elevated) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                error!("could not enumerate windows while reloading borders: {err:#}");
+                return;
+            }
+        };
+
+        let mut initial_windows: Vec<isize> = snapshot.present.keys().copied().collect();
+        initial_windows.sort_unstable();
+        *APP_STATE.initial_windows.lock().unwrap() = initial_windows;
+
+        let mut creatable: Vec<WindowIdentity> = snapshot
+            .present
+            .values()
+            .copied()
+            .filter(|identity| snapshot.creatable.contains(&identity.hwnd))
+            .collect();
+        creatable.sort_by_key(|identity| (identity.hwnd, identity.process_id, identity.thread_id));
+        for identity in creatable {
+            self.create_border(identity);
+        }
+    }
+
     fn refresh_komorebi(&mut self, tracking_hwnds: Vec<isize>) {
         for tracking in tracking_hwnds {
             let Some(record) = self.registry.get_by_key(tracking).copied() else {
@@ -893,6 +972,7 @@ impl BorderRuntime {
         }
         self.location.reset();
         LOCATION_COMMAND_GATE.lock().unwrap().clear();
+        GRAPHICS_REFRESH_STATE.store(GRAPHICS_REFRESH_IDLE, Ordering::Release);
         self.reorder.reset();
         REORDER_COMMAND_PENDING.store(false, Ordering::Release);
         self.animation_timer_interval_ms = None;
@@ -1181,6 +1261,70 @@ impl BorderRuntime {
     }
 }
 
+fn mark_graphics_refresh_requested(state: &AtomicU8) -> bool {
+    loop {
+        match state.load(Ordering::Acquire) {
+            GRAPHICS_REFRESH_IDLE => {
+                if state
+                    .compare_exchange(
+                        GRAPHICS_REFRESH_IDLE,
+                        GRAPHICS_REFRESH_PENDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            GRAPHICS_REFRESH_PENDING => {
+                if state
+                    .compare_exchange(
+                        GRAPHICS_REFRESH_PENDING,
+                        GRAPHICS_REFRESH_DIRTY,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return false;
+                }
+            }
+            GRAPHICS_REFRESH_DIRTY => return false,
+            _ => unreachable!("invalid graphics refresh state"),
+        }
+    }
+}
+
+fn begin_graphics_refresh(state: &AtomicU8) {
+    // Any dirty bit set before execution is already covered by this pass because device state is
+    // sampled now. A new event during execution can set DIRTY again.
+    state.store(GRAPHICS_REFRESH_PENDING, Ordering::Release);
+}
+
+fn finish_graphics_refresh(state: &AtomicU8) -> bool {
+    state.swap(GRAPHICS_REFRESH_IDLE, Ordering::AcqRel) == GRAPHICS_REFRESH_DIRTY
+}
+
+fn sync_directx_devices_with_config() -> WindowsCompatibleResult<()> {
+    let render_backend = APP_STATE.config.read().unwrap().render_backend;
+    let mut directx_devices = APP_STATE.directx_devices.write().unwrap();
+
+    match render_backend {
+        RenderBackendConfig::V2 => match directx_devices.as_mut() {
+            Some(devices) => devices.recreate_if_needed()?,
+            None => {
+                *directx_devices = Some(DirectXDevices::new(&APP_STATE.render_factory)?);
+            }
+        },
+        RenderBackendConfig::Legacy => {
+            *directx_devices = None;
+        }
+    }
+
+    Ok(())
+}
+
 fn animation_interval_ms(fps: u32) -> u32 {
     (1000 / fps.max(1)).max(MIN_ANIMATION_TIMER_INTERVAL_MS)
 }
@@ -1265,11 +1409,14 @@ unsafe extern "system" fn enum_windows_snapshot_callback(hwnd: HWND, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderRuntime, IdentityCommandGate, LOCATION_COALESCE_INTERVAL_MS, LocationAction,
-        LocationCoalescer, REORDER_DEBOUNCE_INTERVAL_MS, ReorderAction, ReorderCoalescer,
-        animation_interval_ms, elevation_allows_border,
+        BorderRuntime, GRAPHICS_REFRESH_DIRTY, GRAPHICS_REFRESH_IDLE, GRAPHICS_REFRESH_PENDING,
+        IdentityCommandGate, LOCATION_COALESCE_INTERVAL_MS, LocationAction, LocationCoalescer,
+        REORDER_DEBOUNCE_INTERVAL_MS, ReorderAction, ReorderCoalescer, animation_interval_ms,
+        begin_graphics_refresh, elevation_allows_border, finish_graphics_refresh,
+        mark_graphics_refresh_requested,
     };
     use crate::border_registry::WindowIdentity;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1392,6 +1539,39 @@ mod tests {
             coalescer.on_timer(start + Duration::from_millis(LOCATION_COALESCE_INTERVAL_MS)),
             vec![first, replacement]
         );
+    }
+
+    #[test]
+    fn graphics_refresh_gate_coalesces_before_runtime_execution() {
+        let state = AtomicU8::new(GRAPHICS_REFRESH_IDLE);
+        assert!(mark_graphics_refresh_requested(&state));
+        assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_PENDING);
+        assert!(!mark_graphics_refresh_requested(&state));
+        assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_DIRTY);
+
+        begin_graphics_refresh(&state);
+        assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_PENDING);
+        assert!(!finish_graphics_refresh(&state));
+        assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_IDLE);
+    }
+
+    #[test]
+    fn graphics_refresh_gate_requests_trailing_pass_for_event_during_execution() {
+        let state = AtomicU8::new(GRAPHICS_REFRESH_PENDING);
+        begin_graphics_refresh(&state);
+        assert!(!mark_graphics_refresh_requested(&state));
+        assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_DIRTY);
+        assert!(finish_graphics_refresh(&state));
+        assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_IDLE);
+    }
+
+    #[test]
+    fn graphics_refresh_gate_can_queue_again_after_completion() {
+        let state = AtomicU8::new(GRAPHICS_REFRESH_PENDING);
+        begin_graphics_refresh(&state);
+        assert!(!finish_graphics_refresh(&state));
+        assert!(mark_graphics_refresh_requested(&state));
+        assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_PENDING);
     }
 
     #[test]

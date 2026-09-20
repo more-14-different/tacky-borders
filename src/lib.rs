@@ -22,7 +22,9 @@ pub mod utils;
 pub mod window_border;
 
 use anyhow::{Context, anyhow};
-use border_runtime::{request_destroy_all_borders, request_recreate_drawers};
+use border_runtime::{
+    request_destroy_all_borders, request_graphics_refresh, request_reload_borders,
+};
 use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback};
 use ipc::IpcServer;
 use komorebi::KomorebiIntegration;
@@ -340,14 +342,9 @@ impl DisplayAdaptersWatcher {
                     break;
                 }
 
-                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut()
-                    && let Err(err) = directx_devices.recreate_if_needed()
-                {
-                    error!("could not recreate directx devices if needed: {err:#}");
-                    break;
-                }
-
-                request_recreate_drawers();
+                // Detection stays on this worker; all DirectX mutation and drawer
+                // recreation is serialized by the runtime/UI thread.
+                request_graphics_refresh();
             }
 
             debug!("exiting display adapters watcher thread");
@@ -583,9 +580,8 @@ pub fn destroy_borders() {
 }
 
 pub fn reload_borders() {
-    destroy_borders();
-    APP_STATE.initial_windows.lock().unwrap().clear();
-    create_borders_for_existing_windows().log_if_err();
+    // Runtime serializes graphics synchronization, destruction and recreation.
+    request_reload_borders();
 }
 
 pub fn display_error_box<T: std::fmt::Display>(

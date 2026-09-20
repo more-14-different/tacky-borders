@@ -4,9 +4,7 @@ use crate::effects::EffectsConfig;
 use crate::komorebi::KomorebiColorsConfig;
 use crate::render_backend::RenderBackendConfig;
 use crate::utils::{OwnedHANDLE, get_adjusted_radius, get_window_corner_preference};
-use crate::{
-    APP_STATE, BG_SERVICES, DirectXDevices, IS_WINDOWS_11, display_error_box, reload_borders,
-};
+use crate::{APP_STATE, BG_SERVICES, IS_WINDOWS_11, display_error_box, reload_borders};
 use anyhow::{Context, anyhow};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
@@ -345,24 +343,8 @@ impl Config {
         let new_config = match Self::create() {
             Ok(config) => {
                 BG_SERVICES.lock().unwrap().reload(&config);
-
-                let mut directx_devices_opt = APP_STATE.directx_devices.write().unwrap();
-
-                if config.render_backend == RenderBackendConfig::V2 && directx_devices_opt.is_none()
-                {
-                    let direct_x_devices = DirectXDevices::new(&APP_STATE.render_factory)
-                        .unwrap_or_else(|err| {
-                            error!("could not create directx devices: {err:#}");
-                            panic!("could not create directx devices: {err:#}");
-                        });
-
-                    *directx_devices_opt = Some(direct_x_devices);
-                } else if config.render_backend == RenderBackendConfig::Legacy
-                    && directx_devices_opt.is_some()
-                {
-                    *directx_devices_opt = None;
-                }
-
+                // DirectX device mutation is runtime-owned. reload_borders() will synchronize the
+                // device set after this config has been published.
                 config
             }
             Err(err) => {
