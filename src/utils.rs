@@ -32,19 +32,14 @@ use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged, IsWindowVisible, PostMessageW,
-    RealGetWindowClassW, SendMessageW, SendNotifyMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    RealGetWindowClassW, SendMessageW, SendNotifyMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CHILD,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
 };
 use windows::core::{BOOL, HRESULT, PWSTR};
 
 use crate::APP_STATE;
 use crate::border_runtime::request_create_border;
 use crate::config::{MatchKind, MatchStrategy, WindowRule};
-
-// Reorder intentionally remains a border-window message because its wnd_proc drains
-// duplicate messages and owns the per-border debounce timer. All other runtime events
-// are direct method calls in phase 4.
-pub const WM_APP_REORDER: u32 = WM_APP + 1;
 
 // T_E_UNINIT indicates an uninitialized object, T_E_ERROR indicates a general error, and
 // T_E_REENTRANCY indicates re-entrancy where there shouldn't have been any. These custom HRESULTs

@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::{
     LazyLock, RwLock,
+    atomic::{AtomicBool, Ordering},
     mpsc::{SyncSender, sync_channel},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -21,7 +22,7 @@ use crate::border_registry::{
 use crate::colors::ColorBrushConfig;
 use crate::config::{EnableMode, OffsetConfig, RadiusConfig, WidthConfig};
 use crate::utils::{
-    LogIfErr, OwnedHWND, WM_APP_REORDER, get_foreground_window, get_last_error, get_window_rule,
+    LogIfErr, OwnedHWND, get_foreground_window, get_last_error, get_window_rule,
     has_filtered_style, is_current_process_elevated, is_process_elevated, is_window_cloaked,
     is_window_top_level, is_window_visible, post_message_w,
 };
@@ -31,12 +32,15 @@ const WM_APP_RUNTIME_COMMAND: u32 = WM_APP + 100;
 const ANIMATION_TIMER_ID: usize = 1;
 const FOREGROUND_POLL_TIMER_ID: usize = 2;
 const RECONCILE_TIMER_ID: usize = 3;
+const REORDER_TIMER_ID: usize = 4;
 const FOREGROUND_POLL_INTERVAL_MS: u32 = 100;
 const RECONCILE_INTERVAL_MS: u32 = 1000;
 const MIN_ANIMATION_TIMER_INTERVAL_MS: u32 = 10;
+const REORDER_DEBOUNCE_INTERVAL_MS: u64 = 16;
 
 static RUNTIME_HANDLE: LazyLock<RwLock<Option<BorderRuntimeHandle>>> =
     LazyLock::new(|| RwLock::new(None));
+static REORDER_COMMAND_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
 pub struct BorderRuntimeHandle {
@@ -134,11 +138,63 @@ struct AnimationRegistration {
     fps: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReorderAction {
+    FlushNow,
+    ArmTimer(Duration),
+    Coalesced,
+}
+
+#[derive(Debug, Default)]
+struct ReorderCoalescer {
+    last_flush: Option<Instant>,
+    timer_armed: bool,
+    pending: bool,
+}
+
+impl ReorderCoalescer {
+    fn on_event(&mut self, now: Instant) -> ReorderAction {
+        if self.timer_armed {
+            self.pending = true;
+            return ReorderAction::Coalesced;
+        }
+
+        if let Some(last_flush) = self.last_flush {
+            let interval = Duration::from_millis(REORDER_DEBOUNCE_INTERVAL_MS);
+            let elapsed = now.saturating_duration_since(last_flush);
+            if elapsed < interval {
+                self.pending = true;
+                self.timer_armed = true;
+                return ReorderAction::ArmTimer(interval - elapsed);
+            }
+        }
+
+        self.last_flush = Some(now);
+        ReorderAction::FlushNow
+    }
+
+    fn on_timer(&mut self, now: Instant) -> bool {
+        self.timer_armed = false;
+        if !self.pending {
+            return false;
+        }
+
+        self.pending = false;
+        self.last_flush = Some(now);
+        true
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Debug, Default)]
 struct BorderRuntime {
     registry: BorderRegistry,
     active_window: isize,
     current_process_elevated: bool,
+    reorder: ReorderCoalescer,
     // Box keeps every WindowBorder at a stable address because the border HWND stores a pointer to
     // the WindowBorder in GWLP_USERDATA. Moving the Box in this map does not move the allocation.
     borders: HashMap<isize, Box<WindowBorder>>,
@@ -160,6 +216,7 @@ impl BorderRuntimeHost {
 
         let current_process_elevated = is_current_process_elevated()?;
         debug!("border runtime elevated: {current_process_elevated}");
+        REORDER_COMMAND_PENDING.store(false, Ordering::Release);
 
         let mut runtime = Box::new(BorderRuntime {
             active_window: get_foreground_window().0 as isize,
@@ -289,7 +346,16 @@ pub fn request_window_event(tracking_window: HWND, event: BorderWindowEvent) {
 }
 
 pub fn request_reorder_borders() {
-    post_runtime_command_logged(BorderRuntimeCommand::Reorder);
+    // EVENT_OBJECT_REORDER can arrive in bursts. Keep at most one Reorder command queued for the
+    // runtime; the runtime performs its own 16 ms trailing coalescing after delivery.
+    if REORDER_COMMAND_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    if let Err(err) = post_runtime_command(BorderRuntimeCommand::Reorder) {
+        REORDER_COMMAND_PENDING.store(false, Ordering::Release);
+        error!("could not post reorder command to border runtime: {err:#}");
+    }
 }
 
 pub fn request_foreground_change(best_hwnd_guess: HWND, other_hwnd_guess: HWND) {
@@ -391,7 +457,7 @@ impl BorderRuntime {
             BorderRuntimeCommand::WindowEvent { identity, event } => {
                 self.handle_window_event(identity, event)
             }
-            BorderRuntimeCommand::Reorder => self.reorder_borders(),
+            BorderRuntimeCommand::Reorder => self.handle_reorder_request(),
             BorderRuntimeCommand::Foreground { tracking_hwnd } => {
                 self.update_foreground(HWND(tracking_hwnd as _))
             }
@@ -463,19 +529,68 @@ impl BorderRuntime {
         self.destroy_border(record.tracking);
     }
 
-    fn reorder_borders(&self) {
-        for record in self.registry.records() {
-            let border_hwnd = record.border_hwnd();
-            if is_window_visible(border_hwnd) {
-                post_message_w(
-                    Some(border_hwnd),
-                    WM_APP_REORDER,
-                    WPARAM::default(),
-                    LPARAM::default(),
-                )
-                .context("could not dispatch reorder event")
-                .log_if_err();
+    fn handle_reorder_request(&mut self) {
+        match self.reorder.on_event(Instant::now()) {
+            ReorderAction::FlushNow => {
+                self.flush_reorder_borders();
+                REORDER_COMMAND_PENDING.store(false, Ordering::Release);
             }
+            ReorderAction::ArmTimer(delay) => self.arm_reorder_timer(delay),
+            ReorderAction::Coalesced => {}
+        }
+    }
+
+    fn arm_reorder_timer(&mut self, delay: Duration) {
+        if self.dispatcher_hwnd == 0 {
+            self.reorder.reset();
+            REORDER_COMMAND_PENDING.store(false, Ordering::Release);
+            return;
+        }
+
+        let delay_ms = delay.as_millis().clamp(1, u32::MAX as u128) as u32;
+        let timer = unsafe {
+            SetTimer(
+                Some(HWND(self.dispatcher_hwnd as _)),
+                REORDER_TIMER_ID,
+                delay_ms,
+                None,
+            )
+        };
+        if timer == 0 {
+            error!("could not arm border runtime reorder timer; flushing immediately");
+            self.reorder.reset();
+            self.flush_reorder_borders();
+            REORDER_COMMAND_PENDING.store(false, Ordering::Release);
+        }
+    }
+
+    fn handle_reorder_timer(&mut self) {
+        if self.dispatcher_hwnd == 0 {
+            return;
+        }
+
+        unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), REORDER_TIMER_ID) }.log_if_err();
+        if self.reorder.on_timer(Instant::now()) {
+            self.flush_reorder_borders();
+        }
+        REORDER_COMMAND_PENDING.store(false, Ordering::Release);
+    }
+
+    fn flush_reorder_borders(&mut self) {
+        // Registry records are copied first so a border can queue its own cleanup without holding
+        // a registry borrow across the direct WindowBorder call.
+        let records = self.registry.records();
+        for record in records {
+            let Some(border) = self.borders.get_mut(&record.tracking.hwnd) else {
+                continue;
+            };
+            if border.tracked_identity() != Some(record.tracking)
+                || !is_window_visible(border.border_window.0)
+            {
+                continue;
+            }
+
+            border.handle_reorder();
         }
     }
 
@@ -574,6 +689,7 @@ impl BorderRuntime {
 
     fn handle_timer(&mut self, timer_id: usize) {
         match timer_id {
+            REORDER_TIMER_ID => self.handle_reorder_timer(),
             ANIMATION_TIMER_ID => self.tick_animations(),
             FOREGROUND_POLL_TIMER_ID => self.reconcile_foreground(),
             RECONCILE_TIMER_ID => self.reconcile_windows().log_if_err(),
@@ -605,10 +721,13 @@ impl BorderRuntime {
         }
         let dispatcher = HWND(self.dispatcher_hwnd as _);
         unsafe {
+            KillTimer(Some(dispatcher), REORDER_TIMER_ID).log_if_err();
             KillTimer(Some(dispatcher), ANIMATION_TIMER_ID).log_if_err();
             KillTimer(Some(dispatcher), FOREGROUND_POLL_TIMER_ID).log_if_err();
             KillTimer(Some(dispatcher), RECONCILE_TIMER_ID).log_if_err();
         }
+        self.reorder.reset();
+        REORDER_COMMAND_PENDING.store(false, Ordering::Release);
         self.animation_timer_interval_ms = None;
     }
 
@@ -709,6 +828,13 @@ impl BorderRuntime {
     }
 
     fn destroy_all_borders(&mut self) {
+        if self.dispatcher_hwnd != 0 {
+            unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), REORDER_TIMER_ID) }
+                .log_if_err();
+        }
+        self.reorder.reset();
+        REORDER_COMMAND_PENDING.store(false, Ordering::Release);
+
         let identities: Vec<WindowIdentity> = self
             .registry
             .records()
@@ -969,7 +1095,11 @@ unsafe extern "system" fn enum_windows_snapshot_callback(hwnd: HWND, lparam: LPA
 
 #[cfg(test)]
 mod tests {
-    use super::{BorderRuntime, animation_interval_ms, elevation_allows_border};
+    use super::{
+        BorderRuntime, REORDER_DEBOUNCE_INTERVAL_MS, ReorderAction, ReorderCoalescer,
+        animation_interval_ms, elevation_allows_border,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn animation_interval_tracks_fastest_reasonable_timer_rate() {
@@ -977,6 +1107,40 @@ mod tests {
         assert_eq!(animation_interval_ms(30), 33);
         assert_eq!(animation_interval_ms(120), 10); // SetTimer is not useful below ~10 ms here.
         assert_eq!(animation_interval_ms(0), 1000);
+    }
+
+    #[test]
+    fn reorder_coalescer_flushes_first_event_immediately() {
+        let start = Instant::now();
+        let mut coalescer = ReorderCoalescer::default();
+        assert_eq!(coalescer.on_event(start), ReorderAction::FlushNow);
+    }
+
+    #[test]
+    fn reorder_coalescer_arms_one_trailing_timer_and_collapses_more_events() {
+        let start = Instant::now();
+        let mut coalescer = ReorderCoalescer::default();
+        assert_eq!(coalescer.on_event(start), ReorderAction::FlushNow);
+        assert_eq!(
+            coalescer.on_event(start + Duration::from_millis(5)),
+            ReorderAction::ArmTimer(Duration::from_millis(11))
+        );
+        assert_eq!(
+            coalescer.on_event(start + Duration::from_millis(6)),
+            ReorderAction::Coalesced
+        );
+        assert!(coalescer.on_timer(start + Duration::from_millis(REORDER_DEBOUNCE_INTERVAL_MS)));
+    }
+
+    #[test]
+    fn reorder_coalescer_flushes_again_after_interval() {
+        let start = Instant::now();
+        let mut coalescer = ReorderCoalescer::default();
+        assert_eq!(coalescer.on_event(start), ReorderAction::FlushNow);
+        assert_eq!(
+            coalescer.on_event(start + Duration::from_millis(REORDER_DEBOUNCE_INTERVAL_MS)),
+            ReorderAction::FlushNow
+        );
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use anyhow::{Context, anyhow};
 use std::ptr;
-use std::time;
 use windows::Win32::Foundation::{
     COLORREF, D2DERR_RECREATE_TARGET, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
 };
@@ -19,13 +18,12 @@ use windows::Win32::UI::HiDpi::MDT_DEFAULT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DBT_DEVNODES_CHANGED, DefWindowProcW,
     GW_HWNDNEXT, GW_HWNDPREV, GWLP_USERDATA, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    HWND_TOP, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN,
-    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, WM_CREATE,
-    WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCDESTROY, WM_PAINT, WM_POWERBROADCAST,
-    WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WS_DISABLED, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    HWND_TOP, KillTimer, LWA_ALPHA, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+    SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW,
+    SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, WM_CREATE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_NCDESTROY, WM_PAINT, WM_POWERBROADCAST, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+    WS_DISABLED, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -42,7 +40,7 @@ use crate::komorebi::WindowKind;
 use crate::render_backend::{RenderBackend, RenderBackendConfig};
 use crate::utils::{
     LogIfErr, OwnedHWND, ReentrancyBlocker, ReentrancyBlockerExt, StandaloneWindowsError,
-    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_REORDER, WindowsCompatibleError,
+    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WindowsCompatibleError,
     WindowsCompatibleResult, WindowsContext, are_rects_same_size, get_dpi_for_monitor,
     get_monitor_info, get_window_rule, get_window_title, has_native_border, is_window,
     is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible, loword,
@@ -50,7 +48,6 @@ use crate::utils::{
 };
 use crate::{APP_STATE, BG_SERVICES};
 
-const REORDER_TIMER_ID: usize = 0;
 const INITIALIZE_TIMER_ID: usize = 1;
 const UNMINIMIZE_TIMER_ID: usize = 2;
 const INITIAL_RENDER_RETRY_TIMER_ID: usize = 3;
@@ -88,9 +85,6 @@ pub struct WindowBorder {
     is_paused: bool,
     is_closing: bool,
     animation_registered: bool,
-    last_reorder_time: Option<time::Instant>,
-    is_debouncing_reorder: bool,
-    consecutive_reorders: u64,
     arranged_override_active: bool, // radius override for arranged/snapped tracking window
 }
 
@@ -127,9 +121,6 @@ impl WindowBorder {
             is_paused: Default::default(),
             is_closing: false,
             animation_registered: false,
-            last_reorder_time: None,
-            is_debouncing_reorder: false,
-            consecutive_reorders: 0,
             arranged_override_active: false,
         });
 
@@ -1096,7 +1087,6 @@ impl WindowBorder {
         self.is_paused = true;
         self.stop_animation_clock();
         unsafe {
-            KillTimer(Some(self.border_window.0), REORDER_TIMER_ID).log_if_err();
             KillTimer(Some(self.border_window.0), INITIALIZE_TIMER_ID).log_if_err();
             KillTimer(Some(self.border_window.0), UNMINIMIZE_TIMER_ID).log_if_err();
             KillTimer(Some(self.border_window.0), INITIAL_RENDER_RETRY_TIMER_ID).log_if_err();
@@ -1151,66 +1141,7 @@ impl WindowBorder {
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
-            // EVENT_OBJECT_REORDER
-            WM_APP_REORDER => {
-                // First check if the tracking window still exists to avoid ghost borders
-                if !self.tracking_identity_is_valid() {
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-
-                // Drain any pending WM_APP_REORDER messages from the queue
-                while unsafe {
-                    PeekMessageW(
-                        &mut MSG::default(),
-                        Some(self.border_window.0),
-                        WM_APP_REORDER,
-                        WM_APP_REORDER,
-                        PM_REMOVE,
-                    )
-                    .as_bool()
-                } {
-                    // Intentionally empty.
-                }
-
-                // Allows the immediate processing of some reorder messages, then debounces after
-                const NUM_REORDERS_BEFORE_DEBOUNCE: u64 = 8;
-                const DEBOUNCE_DELAY: time::Duration = time::Duration::from_millis(16);
-
-                if let Some(last_reorder_time) = self.last_reorder_time
-                    && let time_since_reorder = last_reorder_time.elapsed()
-                    && time_since_reorder < DEBOUNCE_DELAY
-                {
-                    self.consecutive_reorders += 1;
-                    if self.consecutive_reorders >= NUM_REORDERS_BEFORE_DEBOUNCE {
-                        if !self.is_debouncing_reorder {
-                            // Set a timer which fires a WM_TIMER message when it expires
-                            unsafe {
-                                SetTimer(
-                                    Some(self.border_window.0),
-                                    REORDER_TIMER_ID,
-                                    (DEBOUNCE_DELAY - time_since_reorder).as_millis() as u32,
-                                    None,
-                                )
-                            };
-                            self.is_debouncing_reorder = true;
-                        }
-
-                        return LRESULT(0);
-                    }
-                } else {
-                    self.consecutive_reorders = 0;
-                }
-
-                self.handle_reorder();
-            }
             WM_TIMER => match wparam.0 {
-                REORDER_TIMER_ID => {
-                    unsafe { KillTimer(Some(window), REORDER_TIMER_ID) }.log_if_err();
-                    self.is_debouncing_reorder = false;
-                    self.consecutive_reorders = 0;
-                    self.handle_reorder();
-                }
                 INITIALIZE_TIMER_ID => {
                     unsafe { KillTimer(Some(window), INITIALIZE_TIMER_ID) }.log_if_err();
                     if let Err(err) = self.finish_init() {
@@ -1325,7 +1256,12 @@ impl WindowBorder {
         LRESULT(0)
     }
 
-    fn handle_reorder(&mut self) {
+    pub fn handle_reorder(&mut self) {
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+
         match self.config.z_order {
             ZOrderMode::AboveWindow => {
                 // When the tracking window reorders its contents, it may change the z-order. So,
@@ -1345,7 +1281,5 @@ impl WindowBorder {
                 }
             }
         }
-
-        self.last_reorder_time = Some(time::Instant::now());
     }
 }
