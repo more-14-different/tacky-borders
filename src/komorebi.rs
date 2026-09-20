@@ -5,16 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::HWND;
 
-use crate::APP_STATE;
+use crate::border_runtime::request_komorebi_refresh;
 use crate::colors::ColorBrushConfig;
 use crate::config::serde_default_bool;
 use crate::iocp::{UnixStreamSink, write_to_unix_socket};
-use crate::utils::{
-    LogIfErr, WM_APP_KOMOREBI, get_foreground_window, is_window, post_message_w,
-    remove_file_if_exists,
-};
+use crate::utils::{get_foreground_window, is_window, remove_file_if_exists};
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -256,32 +253,33 @@ impl KomorebiIntegration {
         }
 
         let new_focus_state = focus_state_mutex.lock().unwrap();
-
-        let border_records = APP_STATE.border_registry.read().unwrap().records();
-        for record in border_records {
-            let tracking = record.tracking.hwnd;
-            let previous_window_kind = previous_focus_state.get(&tracking);
-            let new_window_kind = new_focus_state.get(&tracking);
-
-            // Only post update messages when the window kind has actually changed
-            if previous_window_kind != new_window_kind {
-                // If the window kinds were just Single and Unfocused, then we can just rely on
-                // tacky-borders' internal logic to update border colors
-                if matches!(
-                    previous_window_kind,
-                    Some(WindowKind::Single) | Some(WindowKind::Unfocused)
-                ) && matches!(
-                    new_window_kind,
-                    Some(WindowKind::Single) | Some(WindowKind::Unfocused)
-                ) {
-                    continue;
-                }
-
-                let border_hwnd = record.border_hwnd();
-                post_message_w(Some(border_hwnd), WM_APP_KOMOREBI, WPARAM(0), LPARAM(0))
-                    .context("WM_APP_KOMOREBI")
-                    .log_if_err();
+        let mut changed_tracking: Vec<isize> = previous_focus_state
+            .keys()
+            .chain(new_focus_state.keys())
+            .copied()
+            .collect();
+        changed_tracking.sort_unstable();
+        changed_tracking.dedup();
+        changed_tracking.retain(|tracking| {
+            let previous_window_kind = previous_focus_state.get(tracking);
+            let new_window_kind = new_focus_state.get(tracking);
+            if previous_window_kind == new_window_kind {
+                return false;
             }
-        }
+
+            // Single <-> Unfocused is already represented by tacky-borders' active/inactive colors.
+            !(matches!(
+                previous_window_kind,
+                Some(WindowKind::Single) | Some(WindowKind::Unfocused)
+            ) && matches!(
+                new_window_kind,
+                Some(WindowKind::Single) | Some(WindowKind::Unfocused)
+            ))
+        });
+        drop(new_focus_state);
+
+        // Runtime filters this list against its private registry, so komorebi never needs border
+        // HWNDs or registry access of its own.
+        request_komorebi_refresh(changed_tracking);
     }
 }

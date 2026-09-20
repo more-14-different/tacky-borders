@@ -22,8 +22,7 @@ pub mod utils;
 pub mod window_border;
 
 use anyhow::{Context, anyhow};
-use border_registry::BorderRegistry;
-use border_runtime::request_destroy_all_borders;
+use border_runtime::{request_destroy_all_borders, request_recreate_drawers};
 use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback};
 use ipc::IpcServer;
 use komorebi::KomorebiIntegration;
@@ -33,15 +32,14 @@ use std::sync::{LazyLock, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
 use utils::{
-    LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WM_APP_RECREATE_DRAWER,
-    WindowsCompatibleResult, WindowsContext, create_border_for_window, get_foreground_window,
-    get_last_error, get_window_rule, has_filtered_style, is_window_cloaked, is_window_top_level,
-    is_window_visible, post_message_w,
+    LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WindowsCompatibleResult, WindowsContext,
+    create_border_for_window, get_foreground_window, get_last_error, get_window_rule,
+    has_filtered_style, is_window_cloaked, is_window_top_level, is_window_visible,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HMODULE, HWND, LPARAM, TRUE,
-    WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1CreateFactory, ID2D1Device, ID2D1Factory1,
@@ -94,7 +92,6 @@ pub static BG_SERVICES: LazyLock<Mutex<BackgroundServices>> =
     LazyLock::new(|| Mutex::new(BackgroundServices::new(&APP_STATE.config.read().unwrap())));
 
 pub struct AppState {
-    pub(crate) border_registry: RwLock<BorderRegistry>,
     initial_windows: Mutex<Vec<isize>>,
     active_window: Mutex<isize>,
     config: RwLock<Config>,
@@ -142,7 +139,6 @@ impl AppState {
         };
 
         AppState {
-            border_registry: RwLock::new(BorderRegistry::default()),
             initial_windows: Mutex::new(Vec::new()),
             active_window: Mutex::new(active_window),
             config: RwLock::new(config),
@@ -355,17 +351,7 @@ impl DisplayAdaptersWatcher {
                     break;
                 }
 
-                let border_hwnds = APP_STATE.border_registry.read().unwrap().border_hwnds();
-                for border_hwnd in border_hwnds {
-                    post_message_w(
-                        Some(border_hwnd),
-                        WM_APP_RECREATE_DRAWER,
-                        WPARAM::default(),
-                        LPARAM::default(),
-                    )
-                    .context("WM_APP_RECREATE_RENDERER")
-                    .log_if_err();
-                }
+                request_recreate_drawers();
             }
 
             debug!("exiting display adapters watcher thread");

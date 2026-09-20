@@ -1,21 +1,22 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::any::type_name;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 
 use crate::APP_STATE;
+use crate::border_runtime::{
+    BorderRuntimeUpdate, request_apply_border_update, request_runtime_snapshot,
+};
 use crate::colors::ColorBrushConfig;
 use crate::config::{Config, OffsetConfig, RadiusConfig, WidthConfig};
 use crate::iocp::{UnixListener, UnixStream};
 use crate::utils::{
     LogIfErr, WM_APP_SET_COLORS, WM_APP_SET_OFFSET, WM_APP_SET_RADIUS, WM_APP_SET_WIDTH,
-    get_border_for_window, post_message_w, remove_file_if_exists,
+    remove_file_if_exists,
 };
 
 pub trait IpcPayload: Clone {
@@ -251,16 +252,21 @@ fn process_command(raw: &str) -> String {
                     config.global.border_radius,
                 )
             };
-            let active_window = {
-                let isize = *APP_STATE.active_window.lock().unwrap();
-                format!("{isize:#x}") // format as hex
+            let snapshot = match request_runtime_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return json!({
+                        "ok": false,
+                        "error": format!("could not query border runtime: {err:#}")
+                    })
+                    .to_string();
+                }
             };
-            let border_count = APP_STATE.border_registry.read().unwrap().len();
 
             json!({
                 "ok": true,
-                "active_window": active_window,
-                "border_count": border_count,
+                "active_window": format!("{:#x}", snapshot.active_window),
+                "border_count": snapshot.border_count,
                 "active_color": active_color,
                 "inactive_color": inactive_color,
                 "border_width": border_width,
@@ -272,46 +278,13 @@ fn process_command(raw: &str) -> String {
     }
 }
 
-fn broadcast_payload<T: IpcPayload>(payload: &T, focused_only: bool) {
-    let border_hwnds: Vec<HWND> = if focused_only {
-        let active_tracking = HWND(*APP_STATE.active_window.lock().unwrap() as _);
-        get_border_for_window(active_tracking)
-            .map(|hwnd| vec![hwnd])
-            .unwrap_or_default()
-    } else {
-        APP_STATE.border_registry.read().unwrap().border_hwnds()
-    };
-
-    // Each border window gets its own heap-allocated payload so that ownership
-    // is unambiguous: the wnd_proc reclaims it with Box::from_raw.
-    for border_hwnd in border_hwnds {
-        let payload_box = Box::new(payload.clone());
-        let payload_ptr = Box::into_raw(payload_box);
-
-        if let Err(err) = post_message_w(
-            Some(border_hwnd),
-            T::WND_MSG,
-            WPARAM(0),
-            LPARAM(payload_ptr as isize),
-        ) {
-            // PostMessage failed — reclaim the payload so it isn't leaked
-            drop(unsafe { Box::from_raw(payload_ptr) });
-            error!(
-                "could not post {} to {border_hwnd:?}: {err:#}",
-                type_name::<T>().rsplit("::").next().unwrap_or("unknown")
-            );
-        }
-    }
-}
-
 fn apply_colors(
     active: Option<ColorBrushConfig>,
     inactive: Option<ColorBrushConfig>,
     focused_only: bool,
 ) {
     if !focused_only {
-        // Update the in-memory global config so newly created borders pick up
-        // the colors too.  The config file is never written.
+        // Update the in-memory global config so newly created borders pick up the colors too.
         let mut config = APP_STATE.config.write().unwrap();
         if let Some(ref color) = active {
             config.global.active_color = color.clone();
@@ -320,33 +293,29 @@ fn apply_colors(
             config.global.inactive_color = color.clone();
         }
     }
-    let payload = IpcSetColorsPayload {
-        active_color: active,
-        inactive_color: inactive,
-    };
-    broadcast_payload(&payload, focused_only);
+    request_apply_border_update(
+        BorderRuntimeUpdate::Colors { active, inactive },
+        focused_only,
+    );
 }
 
 fn apply_width(width_config: WidthConfig, focused_only: bool) {
     if !focused_only {
         APP_STATE.config.write().unwrap().global.border_width = width_config;
     }
-    let payload = IpcSetWidthPayload { width_config };
-    broadcast_payload(&payload, focused_only);
+    request_apply_border_update(BorderRuntimeUpdate::Width(width_config), focused_only);
 }
 
 fn apply_offset(offset_config: OffsetConfig, focused_only: bool) {
     if !focused_only {
         APP_STATE.config.write().unwrap().global.border_offset = offset_config;
     }
-    let payload = IpcSetOffsetPayload { offset_config };
-    broadcast_payload(&payload, focused_only);
+    request_apply_border_update(BorderRuntimeUpdate::Offset(offset_config), focused_only);
 }
 
 fn apply_radius(radius_config: RadiusConfig, focused_only: bool) {
     if !focused_only {
         APP_STATE.config.write().unwrap().global.border_radius = radius_config;
     }
-    let payload = IpcSetRadiusPayload { radius_config };
-    broadcast_payload(&payload, focused_only);
+    request_apply_border_update(BorderRuntimeUpdate::Radius(radius_config), focused_only);
 }

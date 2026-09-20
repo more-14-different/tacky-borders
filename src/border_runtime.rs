@@ -1,7 +1,11 @@
 use anyhow::{Context, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::ptr;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{
+    LazyLock, RwLock,
+    mpsc::{SyncSender, sync_channel},
+};
+use std::time::Duration;
 use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -13,12 +17,17 @@ use windows::core::{BOOL, w};
 
 use crate::APP_STATE;
 use crate::border_registry::{
-    BorderLifecycleState, BorderRecord, WindowIdentity, plan_reconciliation,
+    BorderLifecycleState, BorderRecord, BorderRegistry, WindowIdentity, plan_reconciliation,
 };
-use crate::config::EnableMode;
-use crate::event_hook::handle_foreground_event;
+use crate::colors::ColorBrushConfig;
+use crate::config::{EnableMode, OffsetConfig, RadiusConfig, WidthConfig};
+use crate::ipc::{
+    IpcPayload, IpcSetColorsPayload, IpcSetOffsetPayload, IpcSetRadiusPayload, IpcSetWidthPayload,
+};
 use crate::utils::{
-    LogIfErr, OwnedHWND, get_foreground_window, get_last_error, get_window_rule,
+    LogIfErr, OwnedHWND, WM_APP_FOREGROUND, WM_APP_HIDECLOAKED, WM_APP_KOMOREBI,
+    WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND, WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER,
+    WM_APP_REORDER, WM_APP_SHOWUNCLOAKED, get_foreground_window, get_last_error, get_window_rule,
     has_filtered_style, is_window_cloaked, is_window_top_level, is_window_visible, post_message_w,
 };
 use crate::window_border::WindowBorder;
@@ -59,13 +68,53 @@ impl BorderRuntimeHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderWindowEvent {
+    LocationChange,
+    ShowUncloaked,
+    HideCloaked,
+    MinimizeStart,
+    MinimizeEnd,
+}
+
+impl BorderWindowEvent {
+    fn window_message(self) -> u32 {
+        match self {
+            Self::LocationChange => WM_APP_LOCATIONCHANGE,
+            Self::ShowUncloaked => WM_APP_SHOWUNCLOAKED,
+            Self::HideCloaked => WM_APP_HIDECLOAKED,
+            Self::MinimizeStart => WM_APP_MINIMIZESTART,
+            Self::MinimizeEnd => WM_APP_MINIMIZEEND,
+        }
+    }
+}
+
 #[derive(Debug)]
+pub enum BorderRuntimeUpdate {
+    Colors {
+        active: Option<ColorBrushConfig>,
+        inactive: Option<ColorBrushConfig>,
+    },
+    Width(WidthConfig),
+    Offset(OffsetConfig),
+    Radius(RadiusConfig),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderRuntimeSnapshot {
+    pub active_window: isize,
+    pub border_count: usize,
+}
+
 enum BorderRuntimeCommand {
     Create {
         identity: WindowIdentity,
     },
     Destroy {
         identity: WindowIdentity,
+    },
+    DestroyObserved {
+        hwnd: isize,
     },
     DestroyAll,
     MarkActive {
@@ -74,6 +123,25 @@ enum BorderRuntimeCommand {
     SetAnimation {
         identity: WindowIdentity,
         fps: Option<u32>,
+    },
+    WindowEvent {
+        identity: WindowIdentity,
+        event: BorderWindowEvent,
+    },
+    Reorder,
+    Foreground {
+        tracking_hwnd: isize,
+    },
+    RecreateDrawers,
+    KomorebiRefresh {
+        tracking_hwnds: Vec<isize>,
+    },
+    ApplyUpdate {
+        update: BorderRuntimeUpdate,
+        focused_only: bool,
+    },
+    Snapshot {
+        reply: SyncSender<BorderRuntimeSnapshot>,
     },
 }
 
@@ -85,6 +153,7 @@ struct AnimationRegistration {
 
 #[derive(Debug, Default)]
 struct BorderRuntime {
+    registry: BorderRegistry,
     // Box keeps every WindowBorder at a stable address because the border HWND stores a pointer to
     // the WindowBorder in GWLP_USERDATA. Moving the Box in this map does not move the allocation.
     borders: HashMap<isize, Box<WindowBorder>>,
@@ -169,50 +238,109 @@ fn register_runtime_window_class() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn post_runtime_command(command: BorderRuntimeCommand) {
-    let handle = *RUNTIME_HANDLE.read().unwrap();
-    match handle {
-        Some(handle) => handle.post(command).log_if_err(),
-        None => error!("border runtime is not initialized"),
-    }
+fn runtime_handle() -> anyhow::Result<BorderRuntimeHandle> {
+    RUNTIME_HANDLE
+        .read()
+        .unwrap()
+        .as_ref()
+        .copied()
+        .context("border runtime is not initialized")
+}
+
+fn post_runtime_command(command: BorderRuntimeCommand) -> anyhow::Result<()> {
+    runtime_handle()?.post(command)
+}
+
+fn post_runtime_command_logged(command: BorderRuntimeCommand) {
+    post_runtime_command(command).log_if_err();
 }
 
 pub fn request_create_border(tracking_window: HWND) {
     let Some(identity) = WindowIdentity::capture(tracking_window) else {
         return;
     };
-    post_runtime_command(BorderRuntimeCommand::Create { identity });
+    post_runtime_command_logged(BorderRuntimeCommand::Create { identity });
 }
 
-/// Compatibility entry point for callers that only have an HWND. The registry lookup captures the
-/// already-known identity and the queued command carries that full identity from this point on.
-pub fn request_destroy_border(tracking_window: HWND) {
-    let identity = APP_STATE
-        .border_registry
-        .read()
-        .unwrap()
-        .get(tracking_window)
-        .map(|record| record.tracking);
-
-    if let Some(identity) = identity {
-        request_destroy_border_identity(identity);
-    }
+/// Handles EVENT_OBJECT_DESTROY without exposing the registry to the WinEvent callback.
+///
+/// The runtime resolves the currently registered identity for this numeric HWND, then only destroys
+/// it if that identity no longer matches the live OS window. A delayed destroy event therefore
+/// cannot delete a replacement window that already reused the same HWND with a different PID/TID.
+pub fn request_destroy_observed_window(tracking_window: HWND) {
+    post_runtime_command_logged(BorderRuntimeCommand::DestroyObserved {
+        hwnd: tracking_window.0 as isize,
+    });
 }
 
 pub fn request_destroy_border_identity(identity: WindowIdentity) {
-    post_runtime_command(BorderRuntimeCommand::Destroy { identity });
+    post_runtime_command_logged(BorderRuntimeCommand::Destroy { identity });
 }
 
 pub fn request_destroy_all_borders() {
-    post_runtime_command(BorderRuntimeCommand::DestroyAll);
+    post_runtime_command_logged(BorderRuntimeCommand::DestroyAll);
 }
 
 pub fn request_mark_border_active(identity: WindowIdentity) {
-    post_runtime_command(BorderRuntimeCommand::MarkActive { identity });
+    post_runtime_command_logged(BorderRuntimeCommand::MarkActive { identity });
 }
 
 pub fn request_set_border_animation(identity: WindowIdentity, fps: Option<u32>) {
-    post_runtime_command(BorderRuntimeCommand::SetAnimation { identity, fps });
+    post_runtime_command_logged(BorderRuntimeCommand::SetAnimation { identity, fps });
+}
+
+pub fn request_window_event(tracking_window: HWND, event: BorderWindowEvent) {
+    let Some(identity) = WindowIdentity::capture(tracking_window) else {
+        return;
+    };
+    post_runtime_command_logged(BorderRuntimeCommand::WindowEvent { identity, event });
+}
+
+pub fn request_reorder_borders() {
+    post_runtime_command_logged(BorderRuntimeCommand::Reorder);
+}
+
+pub fn request_foreground_change(best_hwnd_guess: HWND, other_hwnd_guess: HWND) {
+    let tracking_window = if !best_hwnd_guess.is_invalid() {
+        best_hwnd_guess
+    } else {
+        other_hwnd_guess
+    };
+    if tracking_window.is_invalid() {
+        return;
+    }
+
+    post_runtime_command_logged(BorderRuntimeCommand::Foreground {
+        tracking_hwnd: tracking_window.0 as isize,
+    });
+}
+
+pub fn request_recreate_drawers() {
+    post_runtime_command_logged(BorderRuntimeCommand::RecreateDrawers);
+}
+
+pub fn request_komorebi_refresh(mut tracking_hwnds: Vec<isize>) {
+    if tracking_hwnds.is_empty() {
+        return;
+    }
+    tracking_hwnds.sort_unstable();
+    tracking_hwnds.dedup();
+    post_runtime_command_logged(BorderRuntimeCommand::KomorebiRefresh { tracking_hwnds });
+}
+
+pub fn request_apply_border_update(update: BorderRuntimeUpdate, focused_only: bool) {
+    post_runtime_command_logged(BorderRuntimeCommand::ApplyUpdate {
+        update,
+        focused_only,
+    });
+}
+
+pub fn request_runtime_snapshot() -> anyhow::Result<BorderRuntimeSnapshot> {
+    let (reply, response) = sync_channel(1);
+    post_runtime_command(BorderRuntimeCommand::Snapshot { reply })?;
+    response
+        .recv_timeout(Duration::from_secs(2))
+        .context("timed out waiting for border runtime snapshot")
 }
 
 impl BorderRuntime {
@@ -259,20 +387,198 @@ impl BorderRuntime {
         match command {
             BorderRuntimeCommand::Create { identity } => self.create_border(identity),
             BorderRuntimeCommand::Destroy { identity } => self.destroy_border(identity),
+            BorderRuntimeCommand::DestroyObserved { hwnd } => self.destroy_observed(hwnd),
             BorderRuntimeCommand::DestroyAll => self.destroy_all_borders(),
             BorderRuntimeCommand::MarkActive { identity } => {
-                let mut registry = APP_STATE.border_registry.write().unwrap();
-                if registry
-                    .get_by_key(identity.hwnd)
-                    .map(|record| record.tracking)
-                    == Some(identity)
-                {
-                    registry.set_state(identity, BorderLifecycleState::Active);
-                }
+                self.registry
+                    .set_state(identity, BorderLifecycleState::Active);
             }
             BorderRuntimeCommand::SetAnimation { identity, fps } => {
                 self.set_animation_registration(identity, fps)
             }
+            BorderRuntimeCommand::WindowEvent { identity, event } => {
+                self.handle_window_event(identity, event)
+            }
+            BorderRuntimeCommand::Reorder => self.reorder_borders(),
+            BorderRuntimeCommand::Foreground { tracking_hwnd } => {
+                self.update_foreground(HWND(tracking_hwnd as _))
+            }
+            BorderRuntimeCommand::RecreateDrawers => self.recreate_drawers(),
+            BorderRuntimeCommand::KomorebiRefresh { tracking_hwnds } => {
+                self.refresh_komorebi(tracking_hwnds)
+            }
+            BorderRuntimeCommand::ApplyUpdate {
+                update,
+                focused_only,
+            } => self.apply_border_update(update, focused_only),
+            BorderRuntimeCommand::Snapshot { reply } => {
+                let _ = reply.send(self.snapshot());
+            }
+        }
+    }
+
+    fn handle_window_event(&mut self, identity: WindowIdentity, event: BorderWindowEvent) {
+        // The producer captured the identity before posting. If the numeric HWND was destroyed or
+        // reused while the command waited in the queue, do not dispatch the stale event.
+        if !identity.still_matches() {
+            return;
+        }
+
+        match self.registry.get_by_key(identity.hwnd).copied() {
+            Some(record) if record.tracking == identity => {
+                self.dispatch_identity_message(identity, event.window_message());
+            }
+            Some(record) => {
+                // Same numeric HWND now represents a different identity. Remove the old dispatch
+                // entry first. SHOW/UNCLOAK can immediately create the replacement; other events
+                // can wait for SHOW or the periodic reconciliation pass.
+                self.destroy_border(record.tracking);
+                if event == BorderWindowEvent::ShowUncloaked {
+                    self.create_border(identity);
+                }
+            }
+            None if event == BorderWindowEvent::ShowUncloaked => self.create_border(identity),
+            None => {}
+        }
+    }
+
+    fn destroy_observed(&mut self, hwnd: isize) {
+        let Some(record) = self.registry.get_by_key(hwnd).copied() else {
+            return;
+        };
+
+        // EVENT_OBJECT_DESTROY is asynchronous. If the recorded identity still describes a live
+        // window, this may be a late event for an older window that already reused the same HWND.
+        if record.tracking.still_matches() {
+            return;
+        }
+        self.destroy_border(record.tracking);
+    }
+
+    fn dispatch_identity_message(&self, identity: WindowIdentity, message: u32) {
+        let Some(record) = self.registry.get_by_key(identity.hwnd).copied() else {
+            return;
+        };
+        if record.tracking != identity {
+            return;
+        }
+
+        post_message_w(
+            Some(record.border_hwnd()),
+            message,
+            WPARAM::default(),
+            LPARAM::default(),
+        )
+        .context("could not dispatch border runtime event")
+        .log_if_err();
+    }
+
+    fn reorder_borders(&self) {
+        for record in self.registry.records() {
+            let border_hwnd = record.border_hwnd();
+            if is_window_visible(border_hwnd) {
+                post_message_w(
+                    Some(border_hwnd),
+                    WM_APP_REORDER,
+                    WPARAM::default(),
+                    LPARAM::default(),
+                )
+                .context("could not dispatch reorder event")
+                .log_if_err();
+            }
+        }
+    }
+
+    fn update_foreground(&self, new_active_hwnd: HWND) {
+        if new_active_hwnd.is_invalid() {
+            return;
+        }
+
+        let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
+        if old_active_hwnd == new_active_hwnd {
+            return;
+        }
+        *APP_STATE.active_window.lock().unwrap() = new_active_hwnd.0 as isize;
+
+        for tracking_window in [old_active_hwnd, new_active_hwnd] {
+            if tracking_window.is_invalid() {
+                continue;
+            }
+            if let Some(record) = self.registry.get(tracking_window).copied() {
+                self.dispatch_identity_message(record.tracking, WM_APP_FOREGROUND);
+            }
+        }
+    }
+
+    fn recreate_drawers(&self) {
+        for record in self.registry.records() {
+            self.dispatch_identity_message(record.tracking, WM_APP_RECREATE_DRAWER);
+        }
+    }
+
+    fn refresh_komorebi(&self, tracking_hwnds: Vec<isize>) {
+        for tracking in tracking_hwnds {
+            let Some(record) = self.registry.get_by_key(tracking).copied() else {
+                continue;
+            };
+            self.dispatch_identity_message(record.tracking, WM_APP_KOMOREBI);
+        }
+    }
+
+    fn border_update_targets(&self, focused_only: bool) -> Vec<HWND> {
+        if focused_only {
+            let active_tracking = *APP_STATE.active_window.lock().unwrap();
+            self.registry
+                .get_by_key(active_tracking)
+                .map(|record| vec![record.border_hwnd()])
+                .unwrap_or_default()
+        } else {
+            self.registry.border_hwnds()
+        }
+    }
+
+    fn apply_border_update(&self, update: BorderRuntimeUpdate, focused_only: bool) {
+        let targets = self.border_update_targets(focused_only);
+        match update {
+            BorderRuntimeUpdate::Colors { active, inactive } => self.broadcast_ipc_payload(
+                &targets,
+                &IpcSetColorsPayload {
+                    active_color: active,
+                    inactive_color: inactive,
+                },
+            ),
+            BorderRuntimeUpdate::Width(width_config) => {
+                self.broadcast_ipc_payload(&targets, &IpcSetWidthPayload { width_config })
+            }
+            BorderRuntimeUpdate::Offset(offset_config) => {
+                self.broadcast_ipc_payload(&targets, &IpcSetOffsetPayload { offset_config })
+            }
+            BorderRuntimeUpdate::Radius(radius_config) => {
+                self.broadcast_ipc_payload(&targets, &IpcSetRadiusPayload { radius_config })
+            }
+        }
+    }
+
+    fn broadcast_ipc_payload<T: IpcPayload>(&self, targets: &[HWND], payload: &T) {
+        for &border_hwnd in targets {
+            let payload_ptr = Box::into_raw(Box::new(payload.clone()));
+            if let Err(err) = post_message_w(
+                Some(border_hwnd),
+                T::WND_MSG,
+                WPARAM::default(),
+                LPARAM(payload_ptr as isize),
+            ) {
+                // Ownership did not reach the border wnd_proc.
+                drop(unsafe { Box::from_raw(payload_ptr) });
+                error!("could not post IPC border update to {border_hwnd:?}: {err:#}");
+            }
+        }
+    }
+
+    fn snapshot(&self) -> BorderRuntimeSnapshot {
+        BorderRuntimeSnapshot {
+            active_window: *APP_STATE.active_window.lock().unwrap(),
+            border_count: self.registry.len(),
         }
     }
 
@@ -324,10 +630,7 @@ impl BorderRuntime {
         }
         let tracking_window = identity.hwnd();
 
-        let existing = {
-            let registry = APP_STATE.border_registry.read().unwrap();
-            registry.get(tracking_window).copied()
-        };
+        let existing = self.registry.get(tracking_window).copied();
         if let Some(existing) = existing {
             if existing.tracking == identity && self.borders.contains_key(&identity.hwnd) {
                 return;
@@ -335,11 +638,7 @@ impl BorderRuntime {
             if existing.tracking == identity {
                 // Registry survived but its runtime object did not. Drop the stale dispatch entry
                 // and rebuild from the still-valid captured identity.
-                APP_STATE
-                    .border_registry
-                    .write()
-                    .unwrap()
-                    .remove_by_key(identity.hwnd);
+                self.registry.remove_by_key(identity.hwnd);
             } else {
                 self.destroy_border(existing.tracking);
             }
@@ -365,15 +664,11 @@ impl BorderRuntime {
 
         // Register before init. A zero-delay init can fail/queue cleanup synchronously; cleanup must
         // be able to resolve the exact identity immediately instead of leaving an untracked HWND.
-        APP_STATE
-            .border_registry
-            .write()
-            .unwrap()
-            .insert(BorderRecord {
-                tracking: identity,
-                border_hwnd: border_hwnd.0 as isize,
-                state: BorderLifecycleState::Initializing,
-            });
+        self.registry.insert(BorderRecord {
+            tracking: identity,
+            border_hwnd: border_hwnd.0 as isize,
+            state: BorderLifecycleState::Initializing,
+        });
 
         if let Some(mut replaced) = self.borders.insert(identity.hwnd, border) {
             // Defensive: this should only be possible if runtime/registry state diverged.
@@ -393,12 +688,7 @@ impl BorderRuntime {
     }
 
     fn destroy_border(&mut self, expected_identity: WindowIdentity) {
-        let current = APP_STATE
-            .border_registry
-            .read()
-            .unwrap()
-            .get_by_key(expected_identity.hwnd)
-            .copied();
+        let current = self.registry.get_by_key(expected_identity.hwnd).copied();
 
         // A delayed destroy event for an old HWND must never destroy a new window that reused the
         // same numeric handle.
@@ -410,12 +700,7 @@ impl BorderRuntime {
         self.remove_animation_registration(expected_identity);
         self.refresh_animation_timer();
 
-        if let Some(record) = APP_STATE
-            .border_registry
-            .write()
-            .unwrap()
-            .remove_by_key(expected_identity.hwnd)
-        {
+        if let Some(record) = self.registry.remove_by_key(expected_identity.hwnd) {
             debug!(
                 "removing border registry entry: tracking={:?}, border={:?}, pid={}, tid={}",
                 record.tracking.hwnd(),
@@ -433,10 +718,8 @@ impl BorderRuntime {
     }
 
     fn destroy_all_borders(&mut self) {
-        let identities: Vec<WindowIdentity> = APP_STATE
-            .border_registry
-            .read()
-            .unwrap()
+        let identities: Vec<WindowIdentity> = self
+            .registry
             .records()
             .into_iter()
             .map(|record| record.tracking)
@@ -458,10 +741,8 @@ impl BorderRuntime {
     fn set_animation_registration(&mut self, identity: WindowIdentity, fps: Option<u32>) {
         match fps {
             Some(fps) => {
-                let current_identity = APP_STATE
-                    .border_registry
-                    .read()
-                    .unwrap()
+                let current_identity = self
+                    .registry
                     .get_by_key(identity.hwnd)
                     .map(|record| record.tracking);
                 if current_identity != Some(identity) || !self.borders.contains_key(&identity.hwnd)
@@ -523,10 +804,8 @@ impl BorderRuntime {
         let mut stale = Vec::new();
 
         for registration in registrations {
-            let current_identity = APP_STATE
-                .border_registry
-                .read()
-                .unwrap()
+            let current_identity = self
+                .registry
                 .get_by_key(registration.identity.hwnd)
                 .map(|record| record.tracking);
             if current_identity != Some(registration.identity) {
@@ -548,18 +827,18 @@ impl BorderRuntime {
         }
     }
 
-    fn reconcile_foreground(&self) {
-        let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
+    fn reconcile_foreground(&mut self) {
         let new_active_hwnd = get_foreground_window();
+        let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
         if new_active_hwnd != old_active_hwnd && !new_active_hwnd.is_invalid() {
-            handle_foreground_event(new_active_hwnd, old_active_hwnd);
+            self.update_foreground(new_active_hwnd);
         }
     }
 
     fn reconcile_runtime_invariants(&mut self) {
         // Registry entry with no runtime object: remove dispatch first so the next reconcile can
         // recreate it if the tracking identity is still present/eligible.
-        let records = APP_STATE.border_registry.read().unwrap().records();
+        let records = self.registry.records();
         for record in records {
             let runtime_identity = self
                 .borders
@@ -574,10 +853,8 @@ impl BorderRuntime {
 
         // Runtime object with no registry entry: it is unreachable by normal dispatch, so destroy it
         // on the owning UI thread before comparing the OS snapshot.
-        let registered: HashSet<isize> = APP_STATE
-            .border_registry
-            .read()
-            .unwrap()
+        let registered: HashSet<isize> = self
+            .registry
             .records()
             .into_iter()
             .map(|record| record.tracking.hwnd)
@@ -602,7 +879,7 @@ impl BorderRuntime {
         self.reconcile_runtime_invariants();
 
         let snapshot = WindowSnapshot::collect()?;
-        let current = APP_STATE.border_registry.read().unwrap().records();
+        let current = self.registry.records();
         let plan = plan_reconciliation(&current, &snapshot.present, &snapshot.creatable);
 
         // Destroy first. This is required for the HWND-reuse case where one numeric HWND maps to a

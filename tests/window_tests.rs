@@ -1,6 +1,8 @@
 use serial_test::serial;
 use std::{thread, time};
-use tacky_borders::border_runtime::BorderRuntimeHost;
+use tacky_borders::border_runtime::{
+    BorderRuntimeHost, BorderRuntimeSnapshot, request_runtime_snapshot,
+};
 use tacky_borders::utils::get_window_class;
 use tacky_borders::{
     create_borders_for_existing_windows, destroy_borders, register_border_window_class,
@@ -24,6 +26,16 @@ fn pump_runtime_for(duration: time::Duration) {
         }
         thread::sleep(time::Duration::from_millis(1));
     }
+}
+
+fn runtime_snapshot() -> anyhow::Result<BorderRuntimeSnapshot> {
+    // request_runtime_snapshot() is synchronous and the runtime is owned by this test thread, so
+    // issue the request from a worker while this thread continues pumping Win32 messages.
+    let handle = thread::spawn(request_runtime_snapshot);
+    while !handle.is_finished() {
+        pump_runtime_for(time::Duration::from_millis(5));
+    }
+    handle.join().expect("runtime snapshot worker panicked")
 }
 
 #[test]
@@ -62,6 +74,23 @@ fn test_reload_borders() -> anyhow::Result<()> {
     pump_runtime_for(time::Duration::from_millis(50));
 
     unsafe { EnumWindows(Some(enum_windows_tests_callback), LPARAM::default()) }?;
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_runtime_snapshot_after_destroy() -> anyhow::Result<()> {
+    register_border_window_class()?;
+    let _runtime = BorderRuntimeHost::new()?;
+
+    create_borders_for_existing_windows()?;
+    pump_runtime_for(time::Duration::from_millis(50));
+    let _before = runtime_snapshot()?;
+
+    destroy_borders();
+    pump_runtime_for(time::Duration::from_millis(50));
+    assert_eq!(runtime_snapshot()?.border_count, 0);
 
     Ok(())
 }

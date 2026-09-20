@@ -36,8 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HRESULT, PWSTR};
 
 use crate::APP_STATE;
-use crate::border_runtime::{request_create_border, request_destroy_border_identity};
-use crate::config::{EnableMode, MatchKind, MatchStrategy, WindowRule};
+use crate::border_runtime::request_create_border;
+use crate::config::{MatchKind, MatchStrategy, WindowRule};
 
 pub const WM_APP_LOCATIONCHANGE: u32 = WM_APP;
 pub const WM_APP_REORDER: u32 = WM_APP + 1;
@@ -747,59 +747,6 @@ pub fn get_monitor_info(hmonitor: HMONITOR) -> windows::core::Result<MONITORINFO
     };
 
     Ok(mi)
-}
-
-pub fn destroy_border_for_window(tracking_window: HWND) {
-    let identity = APP_STATE
-        .border_registry
-        .read()
-        .unwrap()
-        .get(tracking_window)
-        .map(|record| record.tracking);
-
-    let Some(identity) = identity else {
-        return;
-    };
-
-    // WinEvent delivery is asynchronous. If this numeric HWND has already been reused and the
-    // registry describes the live replacement, a delayed DESTROY must not remove the new border.
-    // A real destroy that is still observable as live will be caught by the identity reaper.
-    if identity.still_matches() {
-        return;
-    }
-
-    request_destroy_border_identity(identity);
-}
-
-pub fn get_border_for_window(hwnd: HWND) -> Option<HWND> {
-    APP_STATE.border_registry.read().unwrap().get_border(hwnd)
-}
-
-pub fn show_border_for_window(hwnd: HWND) {
-    // If the border already exists, simply post a 'SHOW' message to its message queue. Otherwise,
-    // create a new border.
-    if let Some(border) = get_border_for_window(hwnd) {
-        post_message_w(Some(border), WM_APP_SHOWUNCLOAKED, WPARAM(0), LPARAM(0))
-            .context("show_border_for_window")
-            .log_if_err();
-    } else if is_window_top_level(hwnd) && is_window_visible(hwnd) && !is_window_cloaked(hwnd) {
-        let window_rule = get_window_rule(hwnd);
-
-        if window_rule.enabled == Some(EnableMode::Bool(false)) {
-            info!("border is disabled for {hwnd:?}");
-        } else if window_rule.enabled == Some(EnableMode::Bool(true)) || !has_filtered_style(hwnd) {
-            create_border_for_window(hwnd);
-        }
-    }
-}
-
-pub fn hide_border_for_window(hwnd: HWND) {
-    // PostMessage is already asynchronous; an extra short-lived thread only adds churn.
-    if let Some(border) = get_border_for_window(hwnd) {
-        post_message_w(Some(border), WM_APP_HIDECLOAKED, WPARAM(0), LPARAM(0))
-            .context("hide_border_for_window")
-            .log_if_err();
-    }
 }
 
 pub fn get_last_error() -> WIN32_ERROR {
