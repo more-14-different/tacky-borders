@@ -466,8 +466,13 @@ pub fn has_filtered_style(hwnd: HWND) -> bool {
 pub fn get_window_title(hwnd: HWND) -> anyhow::Result<String> {
     let mut title_buf: [u16; 256] = [0; 256];
 
+    // A zero return value can mean either an empty title or an actual failure. GetWindowTextW does
+    // not clear LastError on success, so clear it first to avoid reporting an unrelated earlier
+    // error (for example ERROR_MOD_NOT_FOUND) as the cause of an empty title.
+    unsafe { SetLastError(ERROR_SUCCESS) };
     if unsafe { GetWindowTextW(hwnd, &mut title_buf) } == 0 {
         let last_error = get_last_error();
+        unsafe { SetLastError(ERROR_SUCCESS) };
 
         // ERROR_ENVVAR_NOT_FOUND just means the title is empty which isn't necessarily an issue
         // TODO: figure out whats with the invalid window handles
@@ -475,8 +480,6 @@ pub fn get_window_title(hwnd: HWND) -> anyhow::Result<String> {
             last_error,
             ERROR_ENVVAR_NOT_FOUND | ERROR_SUCCESS | ERROR_INVALID_WINDOW_HANDLE
         ) {
-            // We manually reset LastError here because it doesn't seem to reset by itself
-            unsafe { SetLastError(ERROR_SUCCESS) };
             return Err(anyhow!("{last_error:?}"));
         }
     }
@@ -488,8 +491,10 @@ pub fn get_window_title(hwnd: HWND) -> anyhow::Result<String> {
 pub fn get_window_class(hwnd: HWND) -> anyhow::Result<String> {
     let mut class_buf: [u16; 256] = [0; 256];
 
+    unsafe { SetLastError(ERROR_SUCCESS) };
     if unsafe { RealGetWindowClassW(hwnd, &mut class_buf) } == 0 {
         let last_error = get_last_error();
+        unsafe { SetLastError(ERROR_SUCCESS) };
 
         // ERROR_ENVVAR_NOT_FOUND just means the title is empty which isn't necessarily an issue
         // TODO: figure out whats with the invalid window handles
@@ -497,8 +502,6 @@ pub fn get_window_class(hwnd: HWND) -> anyhow::Result<String> {
             last_error,
             ERROR_ENVVAR_NOT_FOUND | ERROR_SUCCESS | ERROR_INVALID_WINDOW_HANDLE
         ) {
-            // We manually reset LastError here because it doesn't seem to reset by itself
-            unsafe { SetLastError(ERROR_SUCCESS) };
             return Err(anyhow!("{last_error:?}"));
         }
     }
@@ -898,6 +901,34 @@ pub fn cubic_bezier(control_points: &[f32; 4]) -> Result<impl Fn(f32) -> f32 + u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::ERROR_MOD_NOT_FOUND;
+    use windows::Win32::UI::WindowsAndMessaging::CreateWindowExW;
+    use windows::core::w;
+
+    #[test]
+    fn empty_window_title_does_not_reuse_stale_last_error() -> anyhow::Result<()> {
+        let window = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!(""),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+
+        unsafe { SetLastError(ERROR_MOD_NOT_FOUND) };
+        assert_eq!(get_window_title(window.0)?, "");
+
+        Ok(())
+    }
 
     #[test]
     fn test_cubic_bezier() -> anyhow::Result<()> {
