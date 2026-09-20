@@ -33,8 +33,8 @@ use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
 use utils::{
     LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WindowsCompatibleResult, WindowsContext,
-    create_border_for_window, get_foreground_window, get_last_error, get_window_rule,
-    has_filtered_style, is_window_cloaked, is_window_top_level, is_window_visible,
+    create_border_for_window, get_last_error, get_window_rule, has_filtered_style,
+    is_window_cloaked, is_window_top_level, is_window_visible,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
@@ -93,7 +93,6 @@ pub static BG_SERVICES: LazyLock<Mutex<BackgroundServices>> =
 
 pub struct AppState {
     initial_windows: Mutex<Vec<isize>>,
-    active_window: Mutex<isize>,
     config: RwLock<Config>,
     render_factory: ID2D1Factory1,
     directx_devices: RwLock<Option<DirectXDevices>>,
@@ -104,8 +103,6 @@ unsafe impl Sync for AppState {}
 
 impl AppState {
     fn new() -> Self {
-        let active_window = get_foreground_window().0 as isize;
-
         let config = match Config::create() {
             Ok(config) => config,
             Err(err) => {
@@ -140,7 +137,6 @@ impl AppState {
 
         AppState {
             initial_windows: Mutex::new(Vec::new()),
-            active_window: Mutex::new(active_window),
             config: RwLock::new(config),
             render_factory,
             directx_devices: RwLock::new(directx_devices_opt),

@@ -37,21 +37,16 @@ use crate::border_runtime::{
     request_destroy_border_identity, request_mark_border_active, request_set_border_animation,
 };
 use crate::colors::ColorBrushConfig;
-use crate::config::{Offset, WindowRule, ZOrderMode};
-use crate::ipc::{
-    IpcPayload, IpcSetColorsPayload, IpcSetOffsetPayload, IpcSetRadiusPayload, IpcSetWidthPayload,
-};
+use crate::config::{Offset, OffsetConfig, RadiusConfig, WidthConfig, WindowRule, ZOrderMode};
 use crate::komorebi::WindowKind;
 use crate::render_backend::{RenderBackend, RenderBackendConfig};
 use crate::utils::{
     LogIfErr, OwnedHWND, ReentrancyBlocker, ReentrancyBlockerExt, StandaloneWindowsError,
-    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_FOREGROUND, WM_APP_HIDECLOAKED,
-    WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND, WM_APP_MINIMIZESTART,
-    WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED, WindowsCompatibleError,
+    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_REORDER, WindowsCompatibleError,
     WindowsCompatibleResult, WindowsContext, are_rects_same_size, get_dpi_for_monitor,
     get_monitor_info, get_window_rule, get_window_title, has_native_border, is_window,
     is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible, loword,
-    monitor_from_window, post_message_w,
+    monitor_from_window,
 };
 use crate::{APP_STATE, BG_SERVICES};
 
@@ -68,12 +63,12 @@ pub enum WindowState {
 }
 
 impl WindowState {
-    pub fn update(&mut self, self_hwnd: isize, active_hwnd: isize) {
-        if self_hwnd == active_hwnd {
-            *self = WindowState::Active;
+    fn set_active(&mut self, is_active: bool) {
+        *self = if is_active {
+            WindowState::Active
         } else {
-            *self = WindowState::Inactive;
-        }
+            WindowState::Inactive
+        };
     }
 }
 
@@ -180,7 +175,8 @@ impl WindowBorder {
         }
     }
 
-    pub fn init(&mut self, window_rule: WindowRule) -> anyhow::Result<()> {
+    pub fn init(&mut self, window_rule: WindowRule, is_active: bool) -> anyhow::Result<()> {
+        self.window_state.set_active(is_active);
         self.current_monitor = monitor_from_window(self.tracking_window);
         self.current_dpi =
             get_dpi_for_monitor(self.current_monitor, MDT_DEFAULT).map_err(|err| {
@@ -243,7 +239,7 @@ impl WindowBorder {
     }
 
     fn init_border(&mut self) -> anyhow::Result<()> {
-        self.update_color(Some(self.config.initialize_delay));
+        self.update_color_from_state(Some(self.config.initialize_delay));
         self.update_window_rect().log_if_err();
         if self.should_show_border() {
             self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
@@ -262,42 +258,29 @@ impl WindowBorder {
             self.start_animation_clock_if_needed();
         }
 
-        // Handle the edge case where the tracking window is already minimized
+        // These used to be posted back through the border HWND. The runtime now owns the
+        // object and calls its methods directly, so keep initialization on the same direct path.
         if is_window_minimized(self.tracking_window) {
-            post_message_w(
-                Some(self.border_window.0),
-                WM_APP_MINIMIZESTART,
-                WPARAM(0),
-                LPARAM(0),
-            )
-            .context("could not post WM_APP_MINIMIZESTART message in init()")?;
+            self.handle_minimize_start();
         }
 
-        {
+        let needs_komorebi_refresh = {
             let services = BG_SERVICES.lock().unwrap();
-            if let Some(komorebi_integration) = services.komorebi_integration.as_ref() {
-                let self_focus_state = komorebi_integration
-                    .focus_state
-                    .lock()
-                    .unwrap()
-                    .get(&(self.tracking_window.0 as isize))
-                    .copied();
-
-                // Handle the edge case where the focus state is already komorebi-specific upon border creation
-                if !matches!(
-                    self_focus_state,
-                    None | Some(WindowKind::Single) | Some(WindowKind::Unfocused)
-                ) {
-                    post_message_w(
-                        Some(self.border_window.0),
-                        WM_APP_KOMOREBI,
-                        WPARAM(0),
-                        LPARAM(0),
-                    )
-                    .context("could not post WM_APP_KOMOREBI message in init()")
-                    .log_if_err();
-                }
-            }
+            services
+                .komorebi_integration
+                .as_ref()
+                .and_then(|integration| {
+                    integration
+                        .focus_state
+                        .lock()
+                        .unwrap()
+                        .get(&(self.tracking_window.0 as isize))
+                        .copied()
+                })
+                .is_some_and(|kind| !matches!(kind, WindowKind::Single | WindowKind::Unfocused))
+        };
+        if needs_komorebi_refresh {
+            self.handle_komorebi_refresh();
         }
 
         Ok(())
@@ -444,7 +427,7 @@ impl WindowBorder {
         {
             self.init_drawer()
                 .windows_context("could not recreate border drawer")?;
-            self.update_color(None);
+            self.update_color_from_state(None);
             self.render().windows_context("could not render")?;
         }
 
@@ -534,12 +517,7 @@ impl WindowBorder {
         Ok(())
     }
 
-    fn update_color(&mut self, check_delay: Option<u64>) {
-        self.window_state.update(
-            self.tracking_window.0 as isize,
-            *APP_STATE.active_window.lock().unwrap(),
-        );
-
+    fn update_color_from_state(&mut self, check_delay: Option<u64>) {
         match self
             .drawer
             .animations
@@ -827,7 +805,7 @@ impl WindowBorder {
         }
 
         if self.should_show_border() {
-            self.update_color(Some(self.config.unminimize_delay));
+            self.update_color_from_state(Some(self.config.unminimize_delay));
             self.update_window_rect().log_if_err();
             self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
             self.render().log_if_err();
@@ -861,6 +839,240 @@ impl WindowBorder {
             request_set_border_animation(identity, None);
         }
         self.animation_registered = false;
+    }
+
+    pub fn handle_location_change(&mut self) {
+        if self.is_paused {
+            return;
+        }
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+        if !self.should_show_border() {
+            self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
+            self.stop_animation_clock();
+            return;
+        }
+
+        let mut needs_render = false;
+        let new_monitor = monitor_from_window(self.tracking_window);
+        if new_monitor != self.current_monitor {
+            self.current_monitor = new_monitor;
+            debug!("monitor has changed! new monitor: {new_monitor:?}");
+            needs_render |= match self.rescale_border_and_resize_renderer_if_needed(new_monitor) {
+                Ok(is_updated) => is_updated,
+                Err(err) => {
+                    error!("could not update appearance and renderer: {err:#}");
+                    return;
+                }
+            };
+        }
+
+        if self.config.is_radius_auto()
+            && is_window_arranged(self.tracking_window) != self.arranged_override_active
+        {
+            needs_render |= self.sync_border_radius();
+        }
+
+        let prev_rect = self.window_rect;
+        self.update_window_rect().log_if_err();
+        needs_render |= !are_rects_same_size(&self.window_rect, &prev_rect);
+
+        let update_pos_flags = (!is_window_visible(self.border_window.0)).then_some(SWP_SHOWWINDOW);
+        self.update_position(update_pos_flags).log_if_err();
+        if needs_render {
+            self.render().log_if_err();
+        }
+        self.start_animation_clock_if_needed();
+    }
+
+    pub fn handle_foreground_change(&mut self, is_active: bool) {
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+        self.window_state.set_active(is_active);
+        self.update_color_from_state(None);
+        self.update_position(None).log_if_err();
+        self.render().log_if_err();
+    }
+
+    pub fn handle_show_uncloaked(&mut self) {
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+        if !is_window_visible(self.tracking_window)
+            || is_window_cloaked(self.tracking_window)
+            || is_window_minimized(self.tracking_window)
+        {
+            return;
+        }
+
+        if self.should_show_border() {
+            self.update_color_from_state(None);
+            self.update_window_rect().log_if_err();
+            self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
+            self.render().log_if_err();
+            self.start_animation_clock_if_needed();
+        }
+        self.is_paused = false;
+    }
+
+    pub fn handle_hide_cloaked(&mut self) {
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+        self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
+        self.stop_animation_clock();
+        self.is_paused = true;
+    }
+
+    pub fn handle_minimize_start(&mut self) {
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+        self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
+        self.drawer.active_color.set_opacity(0.0).log_if_err();
+        self.drawer.inactive_color.set_opacity(0.0).log_if_err();
+        self.stop_animation_clock();
+        self.is_paused = true;
+    }
+
+    pub fn handle_minimize_end(&mut self) {
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+        if !is_window_visible(self.tracking_window)
+            || is_window_cloaked(self.tracking_window)
+            || is_window_minimized(self.tracking_window)
+        {
+            return;
+        }
+
+        if self.config.unminimize_delay == 0 {
+            self.finish_unminimize();
+        } else {
+            unsafe {
+                SetTimer(
+                    Some(self.border_window.0),
+                    UNMINIMIZE_TIMER_ID,
+                    self.config.unminimize_delay.min(u32::MAX as u64) as u32,
+                    None,
+                )
+            };
+        }
+    }
+
+    pub fn handle_komorebi_refresh(&mut self) {
+        let window_rule = get_window_rule(self.tracking_window);
+        let global = &APP_STATE.config.read().unwrap().global;
+        if !window_rule
+            .komorebi_colors
+            .as_ref()
+            .map(|komocolors| komocolors.enabled)
+            .unwrap_or(global.komorebi_colors.enabled)
+        {
+            return;
+        }
+
+        let window_kind = {
+            let services = BG_SERVICES.lock().unwrap();
+            let Some(komorebi_integration) = services.komorebi_integration.as_ref() else {
+                return;
+            };
+            let focus_state = komorebi_integration.focus_state.lock().unwrap();
+            *focus_state
+                .get(&(self.tracking_window.0 as isize))
+                .unwrap_or_else(|| {
+                    error!("could not get window_kind for komorebi integration");
+                    &WindowKind::Single
+                })
+        };
+
+        if window_kind == WindowKind::Unfocused {
+            return;
+        }
+
+        let single_color_config = window_rule
+            .active_color
+            .as_ref()
+            .unwrap_or(&global.active_color)
+            .clone();
+        let komorebi_colors_config = window_rule
+            .komorebi_colors
+            .as_ref()
+            .unwrap_or(&global.komorebi_colors);
+
+        let active_color_config = match window_kind {
+            WindowKind::Single => single_color_config,
+            WindowKind::Stack => komorebi_colors_config
+                .stack_color
+                .clone()
+                .unwrap_or(single_color_config),
+            WindowKind::Monocle => komorebi_colors_config
+                .monocle_color
+                .clone()
+                .unwrap_or(single_color_config),
+            WindowKind::Floating => komorebi_colors_config
+                .floating_color
+                .clone()
+                .unwrap_or(single_color_config),
+            WindowKind::Unfocused => return,
+        };
+
+        self.update_color_brush(true, active_color_config);
+        self.render().log_if_err();
+    }
+
+    pub fn handle_recreate_drawer(&mut self) {
+        if let Err(err) = self.recreate_drawer_if_needed() {
+            error!("could not recreate border drawer if needed: {err:#}");
+            self.cleanup_and_queue_exit();
+        }
+    }
+
+    pub fn apply_colors(
+        &mut self,
+        active: Option<ColorBrushConfig>,
+        inactive: Option<ColorBrushConfig>,
+    ) {
+        if let Some(active_config) = active {
+            self.update_color_brush(true, active_config);
+        }
+        if let Some(inactive_config) = inactive {
+            self.update_color_brush(false, inactive_config);
+        }
+        self.render().log_if_err();
+    }
+
+    pub fn apply_width(&mut self, width_config: WidthConfig) {
+        self.config.width = width_config;
+        self.drawer.stroke_width = self.config.width_at(self.current_dpi);
+        self.sync_border_radius();
+        self.resize_renderer().log_if_err();
+        self.update_window_rect().log_if_err();
+        self.update_position(None).log_if_err();
+        self.render().log_if_err();
+    }
+
+    pub fn apply_offset(&mut self, offset_config: OffsetConfig) {
+        self.config.offset = offset_config;
+        self.border_offset = self.config.offset_at(self.current_dpi);
+        self.resize_renderer().log_if_err();
+        self.update_window_rect().log_if_err();
+        self.update_position(None).log_if_err();
+        self.render().log_if_err();
+    }
+
+    pub fn apply_radius(&mut self, radius_config: RadiusConfig) {
+        self.config.radius = radius_config;
+        self.sync_border_radius();
+        self.render().log_if_err();
     }
 
     pub fn animation_tick(&mut self) {
@@ -939,70 +1151,6 @@ impl WindowBorder {
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
-            // EVENT_OBJECT_LOCATIONCHANGE
-            WM_APP_LOCATIONCHANGE => {
-                // This is here to prevent LOCATIONCHANGE events from being handled before
-                // MINIMIZEEND or SHOW/UNCLOAKED events.
-                if self.is_paused {
-                    return LRESULT(0);
-                }
-
-                // Check if tracking window still exists to avoid ghost borders
-                if !self.tracking_identity_is_valid() {
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-
-                // This is mainly here to handle cases where a window is made borderless fullscreen
-                // (if 'follow_native_border' is set to true in the config), which doesn't have any
-                // dedicated events like MINIMIZEEND. Note that we don't set 'is_paused' to true as
-                // doing so would prevent us from handling the transition back to a regular window.
-                if !self.should_show_border() {
-                    self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
-                    self.stop_animation_clock();
-
-                    return LRESULT(0);
-                }
-
-                let mut needs_render = false;
-
-                let new_monitor = monitor_from_window(self.tracking_window);
-                if new_monitor != self.current_monitor {
-                    self.current_monitor = new_monitor;
-                    debug!("monitor has changed! new monitor: {new_monitor:?}");
-
-                    needs_render |=
-                        match self.rescale_border_and_resize_renderer_if_needed(new_monitor) {
-                            Ok(is_updated) => is_updated,
-                            Err(err) => {
-                                error!("could not update appearance and renderer: {err:#}");
-                                return LRESULT(0);
-                            }
-                        };
-                }
-
-                // If radius config is Auto, sync radius when the snap/arranged state changes
-                // so that the border is square when arranged, and restored to normal after.
-                if self.config.is_radius_auto()
-                    && is_window_arranged(self.tracking_window) != self.arranged_override_active
-                {
-                    needs_render |= self.sync_border_radius();
-                }
-
-                let prev_rect = self.window_rect;
-                self.update_window_rect().log_if_err();
-                needs_render |= !are_rects_same_size(&self.window_rect, &prev_rect);
-
-                let update_pos_flags =
-                    (!is_window_visible(self.border_window.0)).then_some(SWP_SHOWWINDOW);
-                self.update_position(update_pos_flags).log_if_err();
-
-                if needs_render {
-                    self.render().log_if_err();
-                }
-
-                self.start_animation_clock_if_needed();
-            }
             // EVENT_OBJECT_REORDER
             WM_APP_REORDER => {
                 // First check if the tracking window still exists to avoid ghost borders
@@ -1083,209 +1231,6 @@ impl WindowBorder {
                 }
                 _ => {}
             },
-            // EVENT_SYSTEM_FOREGROUND
-            WM_APP_FOREGROUND => {
-                // Check if tracking window still exists to avoid ghost borders
-                if !self.tracking_identity_is_valid() {
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-
-                self.update_color(None);
-                self.update_position(None).log_if_err();
-                self.render().log_if_err();
-            }
-            // EVENT_OBJECT_SHOW / EVENT_OBJECT_UNCLOAKED
-            // NOTE: This message can still be sent while the window is minimized.
-            WM_APP_SHOWUNCLOAKED => {
-                if !self.tracking_identity_is_valid() {
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-
-                if !is_window_visible(self.tracking_window)
-                    || is_window_cloaked(self.tracking_window)
-                    || is_window_minimized(self.tracking_window)
-                {
-                    return LRESULT(0);
-                }
-
-                if self.should_show_border() {
-                    self.update_color(None);
-                    self.update_window_rect().log_if_err();
-                    self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
-                    self.render().log_if_err();
-
-                    self.start_animation_clock_if_needed();
-                }
-
-                self.is_paused = false;
-            }
-            // EVENT_OBJECT_HIDE / EVENT_OBJECT_CLOAKED
-            WM_APP_HIDECLOAKED => {
-                if !self.tracking_identity_is_valid() {
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-                self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
-                self.stop_animation_clock();
-                self.is_paused = true;
-            }
-            // EVENT_OBJECT_MINIMIZESTART
-            WM_APP_MINIMIZESTART => {
-                if !self.tracking_identity_is_valid() {
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-                self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
-
-                // Needed for the fade animation to work correctly when window is unminimized
-                self.drawer.active_color.set_opacity(0.0).log_if_err();
-                self.drawer.inactive_color.set_opacity(0.0).log_if_err();
-
-                self.stop_animation_clock();
-                self.is_paused = true;
-            }
-            // EVENT_SYSTEM_MINIMIZEEND
-            WM_APP_MINIMIZEEND => {
-                if !self.tracking_identity_is_valid() {
-                    self.cleanup_and_queue_exit();
-                    return LRESULT(0);
-                }
-
-                if !is_window_visible(self.tracking_window)
-                    || is_window_cloaked(self.tracking_window)
-                    || is_window_minimized(self.tracking_window)
-                {
-                    return LRESULT(0);
-                }
-
-                if self.config.unminimize_delay == 0 {
-                    self.finish_unminimize();
-                } else {
-                    unsafe {
-                        SetTimer(
-                            Some(self.border_window.0),
-                            UNMINIMIZE_TIMER_ID,
-                            self.config.unminimize_delay.min(u32::MAX as u64) as u32,
-                            None,
-                        )
-                    };
-                }
-            }
-            WM_APP_KOMOREBI => {
-                let window_rule = get_window_rule(self.tracking_window);
-                let global = &APP_STATE.config.read().unwrap().global;
-
-                // Exit if komorebi colors are disabled for this tracking window
-                // TODO: it might be better to store komorebi_colors in this WindowBorder struct
-                if !window_rule
-                    .komorebi_colors
-                    .as_ref()
-                    .map(|komocolors| komocolors.enabled)
-                    .unwrap_or(global.komorebi_colors.enabled)
-                {
-                    return LRESULT(0);
-                }
-
-                let window_kind = {
-                    let services = BG_SERVICES.lock().unwrap();
-                    let Some(komorebi_integration) = services.komorebi_integration.as_ref() else {
-                        return LRESULT(0);
-                    };
-                    let focus_state = komorebi_integration.focus_state.lock().unwrap();
-
-                    *focus_state
-                        .get(&(self.tracking_window.0 as isize))
-                        .unwrap_or_else(|| {
-                            error!("could not get window_kind for komorebi integration");
-                            &WindowKind::Single
-                        })
-                };
-
-                // Ignore Unfocused window kind because we already have inactive_color for that
-                if window_kind == WindowKind::Unfocused {
-                    return LRESULT(0);
-                }
-
-                // Komorebi's Single window kind just corresponds to a normal active window
-                let single_color_config = window_rule
-                    .active_color
-                    .as_ref()
-                    .unwrap_or(&global.active_color)
-                    .clone();
-                let komorebi_colors_config = window_rule
-                    .komorebi_colors
-                    .as_ref()
-                    .unwrap_or(&global.komorebi_colors);
-
-                let active_color_config = match window_kind {
-                    WindowKind::Single => single_color_config,
-                    WindowKind::Stack => komorebi_colors_config
-                        .stack_color
-                        .clone()
-                        .unwrap_or(single_color_config),
-                    WindowKind::Monocle => komorebi_colors_config
-                        .monocle_color
-                        .clone()
-                        .unwrap_or(single_color_config),
-                    WindowKind::Floating => komorebi_colors_config
-                        .floating_color
-                        .clone()
-                        .unwrap_or(single_color_config),
-                    WindowKind::Unfocused => {
-                        debug!("what."); // It shouldn't be possible to reach this match branch
-                        return LRESULT(0);
-                    }
-                };
-
-                self.update_color_brush(true, active_color_config);
-                self.render().log_if_err();
-            }
-            // This message (and other "set" messages) are sent by the IPC server
-            IpcSetColorsPayload::WND_MSG => {
-                let payload = unsafe { Box::from_raw(lparam.0 as *mut IpcSetColorsPayload) };
-
-                if let Some(active_config) = payload.active_color {
-                    self.update_color_brush(true, active_config);
-                }
-                if let Some(inactive_config) = payload.inactive_color {
-                    self.update_color_brush(false, inactive_config);
-                }
-
-                self.render().log_if_err();
-            }
-            IpcSetWidthPayload::WND_MSG => {
-                let payload = unsafe { Box::from_raw(lparam.0 as *mut IpcSetWidthPayload) };
-
-                self.config.width = payload.width_config;
-                self.drawer.stroke_width = self.config.width_at(self.current_dpi);
-                self.sync_border_radius();
-
-                self.resize_renderer().log_if_err();
-                self.update_window_rect().log_if_err();
-                self.update_position(None).log_if_err();
-                self.render().log_if_err();
-            }
-            IpcSetOffsetPayload::WND_MSG => {
-                let payload = unsafe { Box::from_raw(lparam.0 as *mut IpcSetOffsetPayload) };
-
-                self.config.offset = payload.offset_config;
-                self.border_offset = self.config.offset_at(self.current_dpi);
-
-                self.resize_renderer().log_if_err();
-                self.update_window_rect().log_if_err();
-                self.update_position(None).log_if_err();
-                self.render().log_if_err();
-            }
-            IpcSetRadiusPayload::WND_MSG => {
-                let payload = unsafe { Box::from_raw(lparam.0 as *mut IpcSetRadiusPayload) };
-
-                self.config.radius = payload.radius_config;
-                self.sync_border_radius();
-
-                self.render().log_if_err();
-            }
             WM_PAINT => {
                 let _ = unsafe { ValidateRect(Some(window), None) };
             }
@@ -1349,13 +1294,6 @@ impl WindowBorder {
                     error!("could not recreate border drawer if needed: {err:#}");
                     self.cleanup_and_queue_exit();
                     return LRESULT(0);
-                }
-            }
-            // This message is sent by the DisplayAdaptersWatcher
-            WM_APP_RECREATE_DRAWER => {
-                if let Err(err) = self.recreate_drawer_if_needed() {
-                    error!("could not recreate border drawer if needed: {err:#}");
-                    self.cleanup_and_queue_exit();
                 }
             }
             // This message should let us know when the system enters/leaves sleep/hibernation

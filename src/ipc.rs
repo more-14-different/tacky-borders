@@ -14,52 +14,7 @@ use crate::border_runtime::{
 use crate::colors::ColorBrushConfig;
 use crate::config::{Config, OffsetConfig, RadiusConfig, WidthConfig};
 use crate::iocp::{UnixListener, UnixStream};
-use crate::utils::{
-    LogIfErr, WM_APP_SET_COLORS, WM_APP_SET_OFFSET, WM_APP_SET_RADIUS, WM_APP_SET_WIDTH,
-    remove_file_if_exists,
-};
-
-pub trait IpcPayload: Clone {
-    /// The message to post to the message queue for this payload
-    const WND_MSG: u32;
-}
-
-#[derive(Clone)]
-pub struct IpcSetColorsPayload {
-    pub active_color: Option<ColorBrushConfig>,
-    pub inactive_color: Option<ColorBrushConfig>,
-}
-
-impl IpcPayload for IpcSetColorsPayload {
-    const WND_MSG: u32 = WM_APP_SET_COLORS;
-}
-
-#[derive(Clone)]
-pub struct IpcSetWidthPayload {
-    pub width_config: WidthConfig,
-}
-
-impl IpcPayload for IpcSetWidthPayload {
-    const WND_MSG: u32 = WM_APP_SET_WIDTH;
-}
-
-#[derive(Clone)]
-pub struct IpcSetOffsetPayload {
-    pub offset_config: OffsetConfig,
-}
-
-impl IpcPayload for IpcSetOffsetPayload {
-    const WND_MSG: u32 = WM_APP_SET_OFFSET;
-}
-
-#[derive(Clone)]
-pub struct IpcSetRadiusPayload {
-    pub radius_config: RadiusConfig,
-}
-
-impl IpcPayload for IpcSetRadiusPayload {
-    const WND_MSG: u32 = WM_APP_SET_RADIUS;
-}
+use crate::utils::{LogIfErr, remove_file_if_exists};
 
 pub fn socket_path() -> anyhow::Result<PathBuf> {
     Config::get_dir().map(|dir| dir.join("tacky-borders.sock"))

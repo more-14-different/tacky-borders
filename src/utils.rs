@@ -39,19 +39,10 @@ use crate::APP_STATE;
 use crate::border_runtime::request_create_border;
 use crate::config::{MatchKind, MatchStrategy, WindowRule};
 
-pub const WM_APP_LOCATIONCHANGE: u32 = WM_APP;
+// Reorder intentionally remains a border-window message because its wnd_proc drains
+// duplicate messages and owns the per-border debounce timer. All other runtime events
+// are direct method calls in phase 4.
 pub const WM_APP_REORDER: u32 = WM_APP + 1;
-pub const WM_APP_FOREGROUND: u32 = WM_APP + 2;
-pub const WM_APP_SHOWUNCLOAKED: u32 = WM_APP + 3;
-pub const WM_APP_HIDECLOAKED: u32 = WM_APP + 4;
-pub const WM_APP_MINIMIZESTART: u32 = WM_APP + 5;
-pub const WM_APP_MINIMIZEEND: u32 = WM_APP + 6;
-pub const WM_APP_KOMOREBI: u32 = WM_APP + 8;
-pub const WM_APP_RECREATE_DRAWER: u32 = WM_APP + 9;
-pub const WM_APP_SET_COLORS: u32 = WM_APP + 10;
-pub const WM_APP_SET_WIDTH: u32 = WM_APP + 11;
-pub const WM_APP_SET_OFFSET: u32 = WM_APP + 12;
-pub const WM_APP_SET_RADIUS: u32 = WM_APP + 13;
 
 // T_E_UNINIT indicates an uninitialized object, T_E_ERROR indicates a general error, and
 // T_E_REENTRANCY indicates re-entrancy where there shouldn't have been any. These custom HRESULTs
