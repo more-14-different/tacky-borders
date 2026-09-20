@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde::Deserialize;
 use std::mem::ManuallyDrop;
-use windows::Win32::Foundation::{HWND, LUID};
+use windows::Win32::Foundation::{HWND, LUID, POINT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
 };
@@ -20,6 +20,7 @@ use windows::Win32::Graphics::DirectComposition::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
 };
+use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows::core::Interface;
 
 use crate::APP_STATE;
@@ -52,6 +53,126 @@ pub const EXTRA_BITMAP_PROPS: D2D1_BITMAP_PROPERTIES1 = D2D1_BITMAP_PROPERTIES1 
     dpiY: 96.0,
     colorContext: ManuallyDrop::new(None),
 };
+
+pub(crate) struct D2DMultithreadGuard {
+    multithread: ID2D1Multithread,
+}
+
+impl D2DMultithreadGuard {
+    pub(crate) fn enter() -> WindowsCompatibleResult<Self> {
+        let multithread: ID2D1Multithread = APP_STATE
+            .render_factory
+            .cast()
+            .windows_context("d2d_multithread")?;
+        unsafe { multithread.Enter() };
+        Ok(Self { multithread })
+    }
+}
+
+impl Drop for D2DMultithreadGuard {
+    fn drop(&mut self) {
+        unsafe { self.multithread.Leave() };
+    }
+}
+
+pub(crate) struct D2DDeviceContextDrawGuard<'a> {
+    context: &'a ID2D1DeviceContext,
+    active: bool,
+}
+
+impl<'a> D2DDeviceContextDrawGuard<'a> {
+    pub(crate) fn begin(context: &'a ID2D1DeviceContext) -> Self {
+        unsafe { context.BeginDraw() };
+        Self {
+            context,
+            active: true,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> WindowsCompatibleResult<()> {
+        self.active = false;
+        unsafe { self.context.EndDraw(None, None) }.windows_context("d2d_context.EndDraw()")?;
+        Ok(())
+    }
+}
+
+impl Drop for D2DDeviceContextDrawGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { self.context.EndDraw(None, None) };
+        }
+    }
+}
+
+pub(crate) struct D2DHwndRenderTargetDrawGuard<'a> {
+    target: &'a ID2D1HwndRenderTarget,
+    active: bool,
+}
+
+impl<'a> D2DHwndRenderTargetDrawGuard<'a> {
+    pub(crate) fn begin(target: &'a ID2D1HwndRenderTarget) -> Self {
+        unsafe { target.BeginDraw() };
+        Self {
+            target,
+            active: true,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> WindowsCompatibleResult<()> {
+        self.active = false;
+        unsafe { self.target.EndDraw(None, None) }.windows_context("render_target.EndDraw()")?;
+        Ok(())
+    }
+}
+
+impl Drop for D2DHwndRenderTargetDrawGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { self.target.EndDraw(None, None) };
+        }
+    }
+}
+
+pub(crate) struct DCompSurfaceDrawGuard<'a> {
+    surface: &'a IDCompositionSurface,
+    context: &'a ID2D1DeviceContext,
+    active: bool,
+}
+
+impl<'a> DCompSurfaceDrawGuard<'a> {
+    pub(crate) fn begin(
+        surface: &'a IDCompositionSurface,
+        context: &'a ID2D1DeviceContext,
+        point: &mut POINT,
+    ) -> WindowsCompatibleResult<(Self, IDXGISurface)> {
+        let dxgi_surface: IDXGISurface =
+            unsafe { surface.BeginDraw(None, point) }.windows_context("dxgi_surface")?;
+        Ok((
+            Self {
+                surface,
+                context,
+                active: true,
+            },
+            dxgi_surface,
+        ))
+    }
+
+    pub(crate) fn finish(mut self) -> WindowsCompatibleResult<()> {
+        self.active = false;
+        unsafe { self.context.SetTarget(None) };
+        unsafe { self.surface.EndDraw() }.windows_context("d_comp_surface.EndDraw()")?;
+        Ok(())
+    }
+}
+
+impl Drop for DCompSurfaceDrawGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe { self.context.SetTarget(None) };
+            let _ = unsafe { self.surface.EndDraw() };
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq)]
 pub enum RenderBackendConfig {
@@ -177,12 +298,7 @@ impl V2RenderBackend {
         unsafe {
             d2d_context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-            // Acquire a lock to prevent resource access conflict
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _d2d_multithread_guard = D2DMultithreadGuard::enter()?;
 
             let dxgi_adapter = directx_devices
                 .dxgi_device
@@ -225,7 +341,7 @@ impl V2RenderBackend {
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
 
-            d2d_multithread.Leave();
+            drop(_d2d_multithread_guard);
 
             let (border_bitmap_opt, mask_bitmap_opt) = if create_extra_bitmaps {
                 let (border_bitmap, mask_bitmap) =
@@ -279,12 +395,7 @@ impl V2RenderBackend {
         unsafe {
             self.d2d_context.SetTarget(None);
 
-            // Acquire a lock to prevent resource access conflict
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _d2d_multithread_guard = D2DMultithreadGuard::enter()?;
 
             self.d_comp_visual
                 .SetContent(None)
@@ -296,7 +407,7 @@ impl V2RenderBackend {
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
 
-            d2d_multithread.Leave();
+            drop(_d2d_multithread_guard);
         }
 
         Ok(())
@@ -316,12 +427,7 @@ impl V2RenderBackend {
         self.mask_bitmap = None;
 
         unsafe {
-            // Acquire a lock to prevent resource access conflict
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _d2d_multithread_guard = D2DMultithreadGuard::enter()?;
 
             *self.d_comp_surface = self
                 .d_comp_device
@@ -342,7 +448,7 @@ impl V2RenderBackend {
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
 
-            d2d_multithread.Leave();
+            drop(_d2d_multithread_guard);
         }
         self.surface_size = D2D_SIZE_U { width, height };
 

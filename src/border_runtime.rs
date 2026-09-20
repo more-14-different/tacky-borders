@@ -7,14 +7,17 @@ use std::sync::{
     mpsc::{SyncSender, sync_channel},
 };
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, TRUE, WPARAM};
+use windows::Win32::Foundation::{
+    D2DERR_RECREATE_TARGET, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, TRUE, WPARAM,
+};
+use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, EnumWindows, GWLP_USERDATA,
     GetWindowLongPtrW, HWND_MESSAGE, KillTimer, RegisterClassExW, SetTimer, SetWindowLongPtrW,
     WM_APP, WM_CREATE, WM_NCDESTROY, WM_TIMER, WNDCLASSEXW,
 };
-use windows::core::{BOOL, w};
+use windows::core::{BOOL, HRESULT, w};
 
 use crate::border_registry::{
     BorderLifecycleState, BorderRecord, BorderRegistry, WindowIdentity, plan_reconciliation,
@@ -103,6 +106,12 @@ pub struct BorderRuntimeSnapshot {
     pub border_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphicsRecoveryReason {
+    RenderTargetLost,
+    DeviceLost,
+}
+
 enum BorderRuntimeCommand {
     Create {
         identity: WindowIdentity,
@@ -130,6 +139,9 @@ enum BorderRuntimeCommand {
         tracking_hwnd: isize,
     },
     RefreshGraphics,
+    ForceRecreateDrawers {
+        exclude: Option<WindowIdentity>,
+    },
     ReloadBorders,
     KomorebiRefresh {
         tracking_hwnds: Vec<isize>,
@@ -487,14 +499,24 @@ pub fn request_graphics_refresh() {
     }
 }
 
+pub(crate) fn request_force_recreate_drawers(exclude: Option<WindowIdentity>) {
+    post_runtime_command_logged(BorderRuntimeCommand::ForceRecreateDrawers { exclude });
+}
+
 pub fn request_reload_borders() {
     post_runtime_command_logged(BorderRuntimeCommand::ReloadBorders);
 }
 
 /// Synchronous render-error recovery used by WindowBorder while already executing on the
-/// runtime/UI thread. All production DirectX-device mutation lives in this module.
-pub(crate) fn recover_directx_devices_for_render_error() -> WindowsCompatibleResult<()> {
-    sync_directx_devices_with_config()
+/// runtime/UI thread. Target loss only needs the local drawer rebuilt; device loss must
+/// replace the shared DirectX device even when the adapter LUID did not change.
+pub(crate) fn recover_directx_devices_for_render_error(
+    reason: GraphicsRecoveryReason,
+) -> WindowsCompatibleResult<()> {
+    match reason {
+        GraphicsRecoveryReason::RenderTargetLost => Ok(()),
+        GraphicsRecoveryReason::DeviceLost => force_recreate_directx_devices_with_config(),
+    }
 }
 
 pub fn request_komorebi_refresh(mut tracking_hwnds: Vec<isize>) {
@@ -586,6 +608,9 @@ impl BorderRuntime {
                 self.update_foreground(HWND(tracking_hwnd as _))
             }
             BorderRuntimeCommand::RefreshGraphics => self.handle_graphics_refresh(),
+            BorderRuntimeCommand::ForceRecreateDrawers { exclude } => {
+                self.force_recreate_drawers(exclude)
+            }
             BorderRuntimeCommand::ReloadBorders => self.reload_borders(),
             BorderRuntimeCommand::KomorebiRefresh { tracking_hwnds } => {
                 self.refresh_komorebi(tracking_hwnds)
@@ -814,6 +839,18 @@ impl BorderRuntime {
         for tracking in tracking_windows {
             if let Some(border) = self.borders.get_mut(&tracking) {
                 border.handle_recreate_drawer();
+            }
+        }
+    }
+
+    fn force_recreate_drawers(&mut self, exclude: Option<WindowIdentity>) {
+        let records = self.registry.records();
+        for record in records {
+            if record.state != BorderLifecycleState::Active || Some(record.tracking) == exclude {
+                continue;
+            }
+            if let Some(border) = self.borders.get_mut(&record.tracking.hwnd) {
+                border.handle_force_recreate_drawer();
             }
         }
     }
@@ -1306,6 +1343,33 @@ fn finish_graphics_refresh(state: &AtomicU8) -> bool {
     state.swap(GRAPHICS_REFRESH_IDLE, Ordering::AcqRel) == GRAPHICS_REFRESH_DIRTY
 }
 
+pub(crate) fn classify_graphics_error(code: HRESULT) -> Option<GraphicsRecoveryReason> {
+    if code == D2DERR_RECREATE_TARGET {
+        Some(GraphicsRecoveryReason::RenderTargetLost)
+    } else if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
+        Some(GraphicsRecoveryReason::DeviceLost)
+    } else {
+        None
+    }
+}
+
+fn force_recreate_directx_devices_with_config() -> WindowsCompatibleResult<()> {
+    let render_backend = APP_STATE.config.read().unwrap().render_backend;
+    let mut directx_devices = APP_STATE.directx_devices.write().unwrap();
+
+    match render_backend {
+        RenderBackendConfig::V2 => {
+            info!("force recreating render devices after device loss");
+            *directx_devices = Some(DirectXDevices::new(&APP_STATE.render_factory)?);
+        }
+        RenderBackendConfig::Legacy => {
+            *directx_devices = None;
+        }
+    }
+
+    Ok(())
+}
+
 fn sync_directx_devices_with_config() -> WindowsCompatibleResult<()> {
     let render_backend = APP_STATE.config.read().unwrap().render_backend;
     let mut directx_devices = APP_STATE.directx_devices.write().unwrap();
@@ -1410,14 +1474,17 @@ unsafe extern "system" fn enum_windows_snapshot_callback(hwnd: HWND, lparam: LPA
 mod tests {
     use super::{
         BorderRuntime, GRAPHICS_REFRESH_DIRTY, GRAPHICS_REFRESH_IDLE, GRAPHICS_REFRESH_PENDING,
-        IdentityCommandGate, LOCATION_COALESCE_INTERVAL_MS, LocationAction, LocationCoalescer,
-        REORDER_DEBOUNCE_INTERVAL_MS, ReorderAction, ReorderCoalescer, animation_interval_ms,
-        begin_graphics_refresh, elevation_allows_border, finish_graphics_refresh,
-        mark_graphics_refresh_requested,
+        GraphicsRecoveryReason, IdentityCommandGate, LOCATION_COALESCE_INTERVAL_MS, LocationAction,
+        LocationCoalescer, REORDER_DEBOUNCE_INTERVAL_MS, ReorderAction, ReorderCoalescer,
+        animation_interval_ms, begin_graphics_refresh, classify_graphics_error,
+        elevation_allows_border, finish_graphics_refresh, mark_graphics_refresh_requested,
     };
     use crate::border_registry::WindowIdentity;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::D2DERR_RECREATE_TARGET;
+    use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
+    use windows::core::HRESULT;
 
     #[test]
     fn animation_interval_tracks_fastest_reasonable_timer_rate() {
@@ -1572,6 +1639,27 @@ mod tests {
         assert!(!finish_graphics_refresh(&state));
         assert!(mark_graphics_refresh_requested(&state));
         assert_eq!(state.load(Ordering::Acquire), GRAPHICS_REFRESH_PENDING);
+    }
+
+    #[test]
+    fn graphics_error_classifies_render_target_loss() {
+        assert_eq!(
+            classify_graphics_error(D2DERR_RECREATE_TARGET),
+            Some(GraphicsRecoveryReason::RenderTargetLost)
+        );
+    }
+
+    #[test]
+    fn graphics_error_classifies_device_loss_and_ignores_other_errors() {
+        assert_eq!(
+            classify_graphics_error(DXGI_ERROR_DEVICE_REMOVED),
+            Some(GraphicsRecoveryReason::DeviceLost)
+        );
+        assert_eq!(
+            classify_graphics_error(DXGI_ERROR_DEVICE_RESET),
+            Some(GraphicsRecoveryReason::DeviceLost)
+        );
+        assert_eq!(classify_graphics_error(HRESULT(0)), None);
     }
 
     #[test]

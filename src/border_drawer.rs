@@ -1,23 +1,23 @@
 use anyhow::Context;
 use std::time;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BRUSH_PROPERTIES, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Brush,
-    ID2D1Multithread, ID2D1RenderTarget,
+    ID2D1RenderTarget,
 };
-use windows::Win32::Graphics::Dxgi::IDXGISurface;
-use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
-use crate::APP_STATE;
 use crate::animations::{AnimType, Animations};
 use crate::border_config::BorderConfig;
 use crate::colors::ColorBrush;
 use crate::effects::Effects;
-use crate::render_backend::{RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS};
+use crate::render_backend::{
+    D2DDeviceContextDrawGuard, D2DHwndRenderTargetDrawGuard, D2DMultithreadGuard,
+    DCompSurfaceDrawGuard, RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS,
+};
 use crate::utils::{
     StandaloneWindowsError, T_E_UNINIT, ToWindowsResult, WindowsCompatibleError,
     WindowsCompatibleResult, WindowsContext, WriteLockable,
@@ -186,7 +186,7 @@ impl BorderDrawer {
                 WindowState::Inactive => (&self.active_color, &self.inactive_color),
             };
 
-            render_target.BeginDraw();
+            let draw_guard = D2DHwndRenderTargetDrawGuard::begin(render_target);
             render_target.Clear(None);
 
             if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
@@ -214,7 +214,7 @@ impl BorderDrawer {
                 }
             }
 
-            render_target.EndDraw(None, None)?;
+            draw_guard.finish()?;
         }
 
         Ok(())
@@ -243,29 +243,19 @@ impl BorderDrawer {
                 WindowState::Inactive => (&self.active_color, &self.inactive_color),
             };
 
-            // We're about to use DirectComposition which means we will be using the underlying
-            // Direct3D objects without Direct2D's knowledge. To avoid resource access conflict, we
-            // must explicitly acquire a lock. Read the following article for more info:
-            // https://learn.microsoft.com/en-us/windows/win32/direct2d/multi-threaded-direct2d-apps
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _d2d_multithread_guard = D2DMultithreadGuard::enter()?;
 
             // Set d2d_context's target back to the target_bitmap so we can draw to the display
-            let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
+            let mut point = Default::default();
+            let (surface_draw_guard, dxgi_surface) =
+                DCompSurfaceDrawGuard::begin(&backend.d_comp_surface, d2d_context, &mut point)?;
             let target_bitmap = d2d_context
                 .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
                 .windows_context("target_bitmap")?;
             d2d_context.SetTarget(&target_bitmap);
 
             // Draw to the target_bitmap
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
@@ -293,19 +283,14 @@ impl BorderDrawer {
                 }
             }
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
 
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
-                .windows_context("d_comp_surface.EndDraw()")?;
+            surface_draw_guard.finish()?;
             backend
                 .d_comp_device
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
+            drop(_d2d_multithread_guard);
         }
 
         Ok(())
@@ -352,7 +337,7 @@ impl BorderDrawer {
             d2d_context.SetTarget(border_bitmap);
 
             // Draw to the border_bitmap
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             // We use filled rectangles here because it helps make the effects more visible.
@@ -383,7 +368,7 @@ impl BorderDrawer {
                 }
             }
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
         }
 
         unsafe {
@@ -419,31 +404,21 @@ impl BorderDrawer {
                 None,
             )?;
 
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             self.fill_rectangle(&border_inner_rect, d2d_context, &opaque_brush);
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
         }
 
         unsafe {
-            // We're about to use DirectComposition which means we will be using the underlying
-            // Direct3D objects without Direct2D's knowledge. To avoid resource access conflict, we
-            // must explicitly acquire a lock. Read the following article for more info:
-            // https://learn.microsoft.com/en-us/windows/win32/direct2d/multi-threaded-direct2d-apps
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _d2d_multithread_guard = D2DMultithreadGuard::enter()?;
 
             // Set d2d_context's target back to the target_bitmap so we can draw to the display
-            let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
+            let mut point = Default::default();
+            let (surface_draw_guard, dxgi_surface) =
+                DCompSurfaceDrawGuard::begin(&backend.d_comp_surface, d2d_context, &mut point)?;
             let target_bitmap = d2d_context
                 .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
                 .windows_context("target_bitmap")?;
@@ -456,7 +431,7 @@ impl BorderDrawer {
                 .to_windows_result(T_E_UNINIT)?;
 
             // Draw to the target_bitmap
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             d2d_context.DrawImage(
@@ -467,19 +442,14 @@ impl BorderDrawer {
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
 
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
-                .windows_context("d_comp_surface.EndDraw()")?;
+            surface_draw_guard.finish()?;
             backend
                 .d_comp_device
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
+            drop(_d2d_multithread_guard);
         }
 
         Ok(())

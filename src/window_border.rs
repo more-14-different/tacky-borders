@@ -1,8 +1,6 @@
 use anyhow::{Context, anyhow};
 use std::ptr;
-use windows::Win32::Foundation::{
-    COLORREF, D2DERR_RECREATE_TARGET, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
-};
+use windows::Win32::Foundation::{COLORREF, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{D2D1_BRUSH_PROPERTIES, ID2D1RenderTarget};
 use windows::Win32::Graphics::Dwm::{
@@ -10,8 +8,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmEnableBlurBehindWindow, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_DEVICE_REMOVED,
-    DXGI_GPU_PREFERENCE_UNSPECIFIED, IDXGIAdapter, IDXGIFactory6,
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_UNSPECIFIED, IDXGIAdapter,
+    IDXGIFactory6,
 };
 use windows::Win32::Graphics::Gdi::{CreateRectRgn, HMONITOR, ValidateRect};
 use windows::Win32::UI::HiDpi::MDT_DEFAULT;
@@ -32,8 +30,9 @@ use crate::border_config::BorderConfig;
 use crate::border_drawer::BorderDrawer;
 use crate::border_registry::WindowIdentity;
 use crate::border_runtime::{
-    recover_directx_devices_for_render_error, request_destroy_border_identity,
-    request_graphics_refresh, request_mark_border_active, request_set_border_animation,
+    GraphicsRecoveryReason, classify_graphics_error, recover_directx_devices_for_render_error,
+    request_destroy_border_identity, request_force_recreate_drawers, request_graphics_refresh,
+    request_mark_border_active, request_set_border_animation,
 };
 use crate::colors::ColorBrushConfig;
 use crate::config::{Offset, OffsetConfig, RadiusConfig, WidthConfig, WindowRule, ZOrderMode};
@@ -412,14 +411,26 @@ impl WindowBorder {
         }
     }
 
+    fn reinitialize_drawer(&mut self) -> WindowsCompatibleResult<()> {
+        self.init_drawer()
+            .windows_context("could not recreate border drawer")?;
+        self.update_color_from_state(None);
+        Ok(())
+    }
+
+    fn reinitialize_drawer_without_recovery(&mut self) -> WindowsCompatibleResult<()> {
+        self.raw_init_drawer()
+            .windows_context("could not recreate border drawer")?;
+        self.update_color_from_state(None);
+        Ok(())
+    }
+
     fn recreate_drawer_if_needed(&mut self) -> WindowsCompatibleResult<()> {
         if self
             .needs_drawer_recreation()
             .windows_context("could not check if border drawer needs to be recreated")?
         {
-            self.init_drawer()
-                .windows_context("could not recreate border drawer")?;
-            self.update_color_from_state(None);
+            self.reinitialize_drawer()?;
             self.render().windows_context("could not render")?;
         }
 
@@ -593,19 +604,36 @@ impl WindowBorder {
             static REENTRANCY_BLOCKER: ReentrancyBlocker = ReentrancyBlocker::new();
         }
 
-        if err.code() == D2DERR_RECREATE_TARGET || err.code() == DXGI_ERROR_DEVICE_REMOVED {
+        if let Some(reason) = classify_graphics_error(err.code()) {
             let _guard = REENTRANCY_BLOCKER
                 .enter()
                 .context("handle_directx_errors")
                 .to_windows_result(T_E_REENTRANCY)?;
 
-            recover_directx_devices_for_render_error()
-                .windows_context("could not recreate directx devices if needed")?;
-            // This border needs synchronous recovery for the immediate retry below. Queue one
-            // runtime-wide refresh as well so other borders can drop stale adapter references.
-            request_graphics_refresh();
-            self.recreate_drawer_if_needed()
-                .windows_context("could not recreate border drawer if needed")?;
+            let recover_device = |this: &mut Self| -> WindowsCompatibleResult<()> {
+                recover_directx_devices_for_render_error(GraphicsRecoveryReason::DeviceLost)
+                    .windows_context("could not force recreate DirectX devices")?;
+                request_force_recreate_drawers(this.tracking_identity);
+                this.reinitialize_drawer_without_recovery()
+                    .windows_context("could not recreate border drawer after device loss")
+            };
+
+            match reason {
+                GraphicsRecoveryReason::DeviceLost => recover_device(self)?,
+                GraphicsRecoveryReason::RenderTargetLost => {
+                    // Recreate only this target first. If the new target creation exposes a
+                    // same-adapter DXGI device loss, escalate once to forced device recovery.
+                    if let Err(reinit_err) = self.reinitialize_drawer_without_recovery() {
+                        if classify_graphics_error(reinit_err.code())
+                            == Some(GraphicsRecoveryReason::DeviceLost)
+                        {
+                            recover_device(self)?;
+                        } else {
+                            return Err(reinit_err);
+                        }
+                    }
+                }
+            }
         } else if err.code() == T_E_UNINIT {
             // Functions like render() may be called via callback functions before init()
             // completes, leading to errors due to uninitialized objects. This is likely only
@@ -1024,6 +1052,20 @@ impl WindowBorder {
     pub fn handle_recreate_drawer(&mut self) {
         if let Err(err) = self.recreate_drawer_if_needed() {
             error!("could not recreate border drawer if needed: {err:#}");
+            self.cleanup_and_queue_exit();
+        }
+    }
+
+    pub fn handle_force_recreate_drawer(&mut self) {
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+        if let Err(err) = self
+            .reinitialize_drawer()
+            .and_then(|_| self.render().windows_context("could not render"))
+        {
+            error!("could not force recreate border drawer: {err:#}");
             self.cleanup_and_queue_exit();
         }
     }
