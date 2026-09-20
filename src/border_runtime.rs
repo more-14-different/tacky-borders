@@ -682,8 +682,8 @@ impl BorderRuntime {
 
     fn reset_location_coalescing(&mut self) {
         if self.dispatcher_hwnd != 0 {
-            unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), LOCATION_TIMER_ID) }
-                .log_if_err();
+            // The trailing timer is optional and may already have fired.
+            let _ = unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), LOCATION_TIMER_ID) };
         }
         self.location.reset();
         LOCATION_COMMAND_GATE.lock().unwrap().clear();
@@ -1000,12 +1000,14 @@ impl BorderRuntime {
             return;
         }
         let dispatcher = HWND(self.dispatcher_hwnd as _);
+        // Teardown is idempotent and most of these timers are optional. KillTimer reports a zero
+        // return for an absent timer, often without setting a meaningful last-error value.
         unsafe {
-            KillTimer(Some(dispatcher), LOCATION_TIMER_ID).log_if_err();
-            KillTimer(Some(dispatcher), REORDER_TIMER_ID).log_if_err();
-            KillTimer(Some(dispatcher), ANIMATION_TIMER_ID).log_if_err();
-            KillTimer(Some(dispatcher), FOREGROUND_POLL_TIMER_ID).log_if_err();
-            KillTimer(Some(dispatcher), RECONCILE_TIMER_ID).log_if_err();
+            let _ = KillTimer(Some(dispatcher), LOCATION_TIMER_ID);
+            let _ = KillTimer(Some(dispatcher), REORDER_TIMER_ID);
+            let _ = KillTimer(Some(dispatcher), ANIMATION_TIMER_ID);
+            let _ = KillTimer(Some(dispatcher), FOREGROUND_POLL_TIMER_ID);
+            let _ = KillTimer(Some(dispatcher), RECONCILE_TIMER_ID);
         }
         self.location.reset();
         LOCATION_COMMAND_GATE.lock().unwrap().clear();
@@ -1115,8 +1117,8 @@ impl BorderRuntime {
         self.reset_location_coalescing();
 
         if self.dispatcher_hwnd != 0 {
-            unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), REORDER_TIMER_ID) }
-                .log_if_err();
+            // The trailing timer is optional and may already have fired.
+            let _ = unsafe { KillTimer(Some(HWND(self.dispatcher_hwnd as _)), REORDER_TIMER_ID) };
         }
         self.reorder.reset();
         REORDER_COMMAND_PENDING.store(false, Ordering::Release);

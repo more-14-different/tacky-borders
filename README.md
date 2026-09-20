@@ -62,6 +62,26 @@ Alternatively, if you wish to build it yourself, you can follow these steps:
    cargo run --release
    ```
 
+### Local Development Scripts
+
+On Windows, the repository includes two PowerShell helpers:
+
+```powershell
+# Stop the existing instance, rebuild the debug executable, and restart it.
+.\run-debug.ps1
+
+# Stop the existing instance and restart the already-built release executable.
+.\run-release.ps1
+```
+
+Both scripts also accept `-StopOnly`. The release helper intentionally does not build; run
+`cargo build --release` first when a new release binary is needed.
+
+The application does not load `config.yaml` from beside the executable. By default, debug and
+release builds both use `%USERPROFILE%\.config\tacky-borders\config.yaml`. To use an isolated
+configuration, set `TACKY_BORDERS_CONFIG_HOME` to a stable directory before starting the app. Do
+not keep the only copy under `target`, because `cargo clean` removes that directory.
+
 ## Uninstallation
 
 To uninstall, it's as easy as deleting `tacky-borders.exe`.

@@ -678,8 +678,13 @@ impl WindowBorder {
     pub fn render(&mut self) -> WindowsCompatibleResult<()> {
         self.raw_render()
             .or_else(|err| {
+                let should_retry = err.code() != T_E_UNINIT;
                 self.handle_directx_errors(err)?;
-                self.raw_render()
+                if should_retry {
+                    self.raw_render()
+                } else {
+                    Ok(())
+                }
             })
             .inspect_err(|err| {
                 if err.code() != T_E_REENTRANCY {
@@ -729,8 +734,13 @@ impl WindowBorder {
     fn resize_renderer(&mut self) -> WindowsCompatibleResult<()> {
         self.raw_resize_renderer()
             .or_else(|err| {
+                let should_retry = err.code() != T_E_UNINIT;
                 self.handle_directx_errors(err)?;
-                self.raw_resize_renderer()
+                if should_retry {
+                    self.raw_resize_renderer()
+                } else {
+                    Ok(())
+                }
             })
             .inspect_err(|err| {
                 if err.code() != T_E_REENTRANCY {
@@ -913,6 +923,13 @@ impl WindowBorder {
             return;
         }
         self.window_state.set_active(is_active);
+
+        // Foreground events can arrive during initialize_delay. Preserve the latest state so
+        // init_border renders the correct color, but do not try to draw before a backend exists.
+        if matches!(self.drawer.render_backend, RenderBackend::None) {
+            return;
+        }
+
         self.update_color_from_state(None);
         self.update_position(None).log_if_err();
         self.render().log_if_err();
@@ -1127,12 +1144,22 @@ impl WindowBorder {
     }
 
     pub fn prepare_for_destroy(&mut self) {
+        if self.is_closing {
+            return;
+        }
+        self.is_closing = true;
         self.is_paused = true;
         self.stop_animation_clock();
+
+        // Teardown is intentionally best-effort. Any of these one-shot timers may already have
+        // fired or may never have been armed, in which case KillTimer returns zero without a useful
+        // last-error value. The window is about to be destroyed, so there is nothing actionable to
+        // report and treating that state as an error only produces "operation completed
+        // successfully" log spam.
         unsafe {
-            KillTimer(Some(self.border_window.0), INITIALIZE_TIMER_ID).log_if_err();
-            KillTimer(Some(self.border_window.0), UNMINIMIZE_TIMER_ID).log_if_err();
-            KillTimer(Some(self.border_window.0), INITIAL_RENDER_RETRY_TIMER_ID).log_if_err();
+            let _ = KillTimer(Some(self.border_window.0), INITIALIZE_TIMER_ID);
+            let _ = KillTimer(Some(self.border_window.0), UNMINIMIZE_TIMER_ID);
+            let _ = KillTimer(Some(self.border_window.0), INITIAL_RENDER_RETRY_TIMER_ID);
         }
     }
 
@@ -1144,7 +1171,6 @@ impl WindowBorder {
             return;
         };
         request_destroy_border_identity(identity);
-        self.is_closing = true;
         self.prepare_for_destroy();
     }
 
@@ -1212,7 +1238,6 @@ impl WindowBorder {
                 // DestroyWindow is initiated by BorderRuntime on the creator thread. Do not queue
                 // another removal from inside WM_NCDESTROY; the runtime already removed dispatch.
                 unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) };
-                self.is_closing = true;
                 self.prepare_for_destroy();
             }
             // This message is sent when a display setting has changed (e.g. resolution change). It
