@@ -18,10 +18,12 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Diagnostics::Debug::FACILITY_ITF;
 use windows::Win32::System::Registry::{HKEY, RegCloseKey};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, GetDpiForMonitor, MONITOR_DPI_TYPE, SetProcessDpiAwarenessContext,
@@ -377,6 +379,43 @@ impl Drop for OwnedHANDLE {
             .with_context(|| format!("could not close {:?}", self.0))
             .log_if_err();
     }
+}
+
+pub fn is_current_process_elevated() -> anyhow::Result<bool> {
+    is_process_handle_elevated(unsafe { GetCurrentProcess() })
+        .context("could not query current process elevation")
+}
+
+pub fn is_process_elevated(process_id: u32) -> anyhow::Result<bool> {
+    let process = OwnedHANDLE(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+            .with_context(|| format!("could not open process {process_id}"))?,
+    );
+
+    is_process_handle_elevated(process.0)
+        .with_context(|| format!("could not query elevation for process {process_id}"))
+}
+
+fn is_process_handle_elevated(process: HANDLE) -> anyhow::Result<bool> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
+        .context("could not open process token")?;
+    let token = OwnedHANDLE(token);
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned_size = 0;
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some(ptr::addr_of_mut!(elevation).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned_size,
+        )
+    }
+    .context("could not read process token elevation")?;
+
+    Ok(elevation.TokenIsElevated != 0)
 }
 
 #[derive(Debug)]

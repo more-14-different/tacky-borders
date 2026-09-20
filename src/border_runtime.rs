@@ -22,7 +22,8 @@ use crate::colors::ColorBrushConfig;
 use crate::config::{EnableMode, OffsetConfig, RadiusConfig, WidthConfig};
 use crate::utils::{
     LogIfErr, OwnedHWND, WM_APP_REORDER, get_foreground_window, get_last_error, get_window_rule,
-    has_filtered_style, is_window_cloaked, is_window_top_level, is_window_visible, post_message_w,
+    has_filtered_style, is_current_process_elevated, is_process_elevated, is_window_cloaked,
+    is_window_top_level, is_window_visible, post_message_w,
 };
 use crate::window_border::WindowBorder;
 
@@ -137,6 +138,7 @@ struct AnimationRegistration {
 struct BorderRuntime {
     registry: BorderRegistry,
     active_window: isize,
+    current_process_elevated: bool,
     // Box keeps every WindowBorder at a stable address because the border HWND stores a pointer to
     // the WindowBorder in GWLP_USERDATA. Moving the Box in this map does not move the allocation.
     borders: HashMap<isize, Box<WindowBorder>>,
@@ -156,8 +158,12 @@ impl BorderRuntimeHost {
     pub fn new() -> anyhow::Result<Self> {
         register_runtime_window_class()?;
 
+        let current_process_elevated = is_current_process_elevated()?;
+        debug!("border runtime elevated: {current_process_elevated}");
+
         let mut runtime = Box::new(BorderRuntime {
             active_window: get_foreground_window().0 as isize,
+            current_process_elevated,
             ..Default::default()
         });
         let dispatcher = unsafe {
@@ -628,7 +634,7 @@ impl BorderRuntime {
             }
         }
 
-        if !should_create_border(tracking_window) {
+        if !should_create_border(identity, self.current_process_elevated) {
             return;
         }
 
@@ -863,7 +869,7 @@ impl BorderRuntime {
     fn reconcile_windows(&mut self) -> anyhow::Result<()> {
         self.reconcile_runtime_invariants();
 
-        let snapshot = WindowSnapshot::collect()?;
+        let snapshot = WindowSnapshot::collect(self.current_process_elevated)?;
         let current = self.registry.records();
         let plan = plan_reconciliation(&current, &snapshot.present, &snapshot.creatable);
 
@@ -884,8 +890,21 @@ fn animation_interval_ms(fps: u32) -> u32 {
     (1000 / fps.max(1)).max(MIN_ANIMATION_TIMER_INTERVAL_MS)
 }
 
-fn should_create_border(hwnd: HWND) -> bool {
+fn should_create_border(identity: WindowIdentity, current_process_elevated: bool) -> bool {
+    let hwnd = identity.hwnd();
     if !is_window_top_level(hwnd) || !is_window_visible(hwnd) || is_window_cloaked(hwnd) {
+        return false;
+    }
+
+    // UIPI prevents a non-elevated process from positioning its border relative to an elevated
+    // window. Filter that window before initialization so reconciliation does not retry it every
+    // second. An elevation-query failure is treated conservatively while we are non-elevated.
+    let target_process_elevated = if current_process_elevated {
+        None
+    } else {
+        is_process_elevated(identity.process_id).ok()
+    };
+    if !elevation_allows_border(current_process_elevated, target_process_elevated) {
         return false;
     }
 
@@ -896,6 +915,13 @@ fn should_create_border(hwnd: HWND) -> bool {
     window_rule.enabled == Some(EnableMode::Bool(true)) || !has_filtered_style(hwnd)
 }
 
+fn elevation_allows_border(
+    current_process_elevated: bool,
+    target_process_elevated: Option<bool>,
+) -> bool {
+    current_process_elevated || target_process_elevated == Some(false)
+}
+
 #[derive(Debug, Default)]
 struct WindowSnapshot {
     // All currently-present top-level identities. Hidden/minimized/cloaked windows remain here so
@@ -903,11 +929,15 @@ struct WindowSnapshot {
     present: HashMap<isize, WindowIdentity>,
     // Subset that is eligible for a newly-created border right now.
     creatable: HashSet<isize>,
+    current_process_elevated: bool,
 }
 
 impl WindowSnapshot {
-    fn collect() -> anyhow::Result<Self> {
-        let mut snapshot = Self::default();
+    fn collect(current_process_elevated: bool) -> anyhow::Result<Self> {
+        let mut snapshot = Self {
+            current_process_elevated,
+            ..Default::default()
+        };
         unsafe {
             EnumWindows(
                 Some(enum_windows_snapshot_callback),
@@ -930,7 +960,7 @@ unsafe extern "system" fn enum_windows_snapshot_callback(hwnd: HWND, lparam: LPA
 
     let snapshot = unsafe { &mut *(lparam.0 as *mut WindowSnapshot) };
     snapshot.present.insert(identity.hwnd, identity);
-    if should_create_border(hwnd) {
+    if should_create_border(identity, snapshot.current_process_elevated) {
         snapshot.creatable.insert(identity.hwnd);
     }
 
@@ -939,7 +969,7 @@ unsafe extern "system" fn enum_windows_snapshot_callback(hwnd: HWND, lparam: LPA
 
 #[cfg(test)]
 mod tests {
-    use super::{BorderRuntime, animation_interval_ms};
+    use super::{BorderRuntime, animation_interval_ms, elevation_allows_border};
 
     #[test]
     fn animation_interval_tracks_fastest_reasonable_timer_rate() {
@@ -956,5 +986,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(runtime.snapshot().active_window, 0x1234);
+    }
+
+    #[test]
+    fn elevation_policy_blocks_only_inaccessible_targets() {
+        assert!(elevation_allows_border(false, Some(false)));
+        assert!(!elevation_allows_border(false, Some(true)));
+        assert!(!elevation_allows_border(false, None));
+        assert!(elevation_allows_border(true, Some(false)));
+        assert!(elevation_allows_border(true, Some(true)));
+        assert!(elevation_allows_border(true, None));
     }
 }
