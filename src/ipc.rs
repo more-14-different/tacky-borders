@@ -75,7 +75,7 @@ impl Drop for IpcServer {
     }
 }
 
-const IPC_CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const IPC_CLIENT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct ClientWorker {
     handle: JoinHandle<()>,
@@ -108,8 +108,12 @@ fn run_server(listener: UnixListener, stop: Arc<AtomicBool>) {
                 }
 
                 reap_client_workers(&mut client_workers);
-                if let Err(err) = stream.set_read_timeout(IPC_CLIENT_READ_TIMEOUT) {
+                if let Err(err) = stream.set_read_timeout(IPC_CLIENT_IO_TIMEOUT) {
                     error!("could not set ipc client read timeout: {err}");
+                    continue;
+                }
+                if let Err(err) = stream.set_write_timeout(IPC_CLIENT_IO_TIMEOUT) {
+                    error!("could not set ipc client write timeout: {err}");
                     continue;
                 }
 

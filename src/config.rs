@@ -12,21 +12,24 @@ use std::fs::{self, DirBuilder};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Mutex,
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::thread::JoinHandle;
 use std::{env, iter, ptr, slice, thread, time};
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{HANDLE, HWND, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Dwm::{
     DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    ReadDirectoryChangesW,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
 };
-use windows::Win32::System::IO::CancelIoEx;
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::Threading::{
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+};
 use windows::core::PCWSTR;
 
 const DEFAULT_CONFIG: &str = include_str!("resources/config.yaml");
@@ -35,21 +38,90 @@ const CONFIG_RELOAD_IDLE: u8 = 0;
 const CONFIG_RELOAD_PENDING: u8 = 1;
 const CONFIG_RELOAD_DIRTY: u8 = 2;
 static CONFIG_RELOAD_STATE: AtomicU8 = AtomicU8::new(CONFIG_RELOAD_IDLE);
+static CONFIG_RELOAD_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static CONFIG_RELOAD_WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+static CONFIG_ERROR_DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn show_config_error_once(message: String) {
+    if CONFIG_ERROR_DIALOG_OPEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        debug!("config error dialog is already open; suppressing duplicate dialog");
+        return;
+    }
+
+    let spawn_result = thread::Builder::new()
+        .name("tacky-config-error".to_string())
+        .spawn(move || {
+            struct ResetDialogGate;
+            impl Drop for ResetDialogGate {
+                fn drop(&mut self) {
+                    CONFIG_ERROR_DIALOG_OPEN.store(false, Ordering::Release);
+                }
+            }
+
+            let _reset = ResetDialogGate;
+            display_error_box(message, None);
+        });
+
+    if let Err(err) = spawn_result {
+        CONFIG_ERROR_DIALOG_OPEN.store(false, Ordering::Release);
+        error!("could not spawn config error dialog worker: {err}");
+    }
+}
 
 /// Requests a serialized config reload from a short-lived management worker. The worker is never
 /// the ConfigWatcher, tray, or IPC client thread, so reconfiguring BackgroundServices can safely
 /// stop and join any of those services without self-join or lock inversion.
 pub fn request_config_reload() {
+    if CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
+        return;
+    }
     if !mark_config_reload_requested(&CONFIG_RELOAD_STATE) {
         return;
     }
 
-    let spawn_result = thread::Builder::new()
-        .name("tacky-config-reload".to_string())
-        .spawn(run_config_reload_worker);
-    if let Err(err) = spawn_result {
+    let mut worker_slot = CONFIG_RELOAD_WORKER.lock().unwrap();
+    if CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
         CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
-        error!("could not spawn config reload worker: {err}");
+        return;
+    }
+
+    if let Some(handle) = worker_slot.take()
+        && let Err(err) = handle.join()
+    {
+        error!("previous config reload worker panicked: {err:?}");
+    }
+
+    if CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
+        CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+        return;
+    }
+
+    match thread::Builder::new()
+        .name("tacky-config-reload".to_string())
+        .spawn(run_config_reload_worker)
+    {
+        Ok(handle) => *worker_slot = Some(handle),
+        Err(err) => {
+            CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+            error!("could not spawn config reload worker: {err}");
+        }
+    }
+}
+
+/// Stops accepting reload requests and waits for the current management worker to finish. Call
+/// this before destroying borders or background services so a late reload cannot recreate either.
+pub fn begin_config_shutdown() {
+    CONFIG_RELOAD_SHUTTING_DOWN.store(true, Ordering::Release);
+    CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+
+    let handle = CONFIG_RELOAD_WORKER.lock().unwrap().take();
+    if let Some(handle) = handle
+        && let Err(err) = handle.join()
+    {
+        error!("config reload worker panicked during shutdown: {err:?}");
     }
 }
 
@@ -138,19 +210,31 @@ fn run_config_reload_worker() {
     let mut reset = ResetReloadState { armed: true };
 
     loop {
+        if CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
+            CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+            reset.armed = false;
+            break;
+        }
+
         let old_config = (*APP_STATE.config.read().unwrap()).clone();
         let reconfigure_services = Config::reload_with_status();
         let new_config = (*APP_STATE.config.read().unwrap()).clone();
 
         // Preserve the existing parse-error behavior: a malformed file may temporarily publish the
         // default config, but it must not disable the watcher that is needed to observe the fix.
-        if reconfigure_services {
+        if reconfigure_services && !CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
             BG_SERVICES.lock().unwrap().reload(&new_config);
         }
 
-        if old_config != new_config {
+        if old_config != new_config && !CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
             info!("config.yaml has changed; reloading borders");
             reload_borders();
+        }
+
+        if CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
+            CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+            reset.armed = false;
+            break;
         }
 
         if !finish_config_reload_pass(&CONFIG_RELOAD_STATE) {
@@ -477,9 +561,7 @@ impl Config {
             Ok(config) => (config, true),
             Err(err) => {
                 error!("could not reload config: {err:#}");
-                thread::spawn(move || {
-                    display_error_box(format!("could not reload config: {err:#}"), None);
-                });
+                show_config_error_once(format!("could not reload config: {err:#}"));
 
                 (Config::default(), false)
             }
@@ -532,7 +614,8 @@ impl Config {
 #[derive(Debug)]
 pub struct ConfigWatcher {
     dir_handle: OwnedHANDLE,
-    stop: Arc<AtomicBool>,
+    _changed_event: OwnedHANDLE,
+    stop_event: OwnedHANDLE,
     thread_handle: Option<JoinHandle<()>>,
 }
 
@@ -559,65 +642,112 @@ impl ConfigWatcher {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     None,
                     OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
                     None,
                 )
             }
-            .context("could not create dir handle for config watcher")?;
+            .context("could not create overlapped dir handle for config watcher")?;
             OwnedHANDLE(handle)
         };
+        let changed_event = OwnedHANDLE(unsafe { CreateEventW(None, false, false, None)? });
+        let stop_event = OwnedHANDLE(unsafe { CreateEventW(None, true, false, None)? });
 
-        // Convert HANDLE to isize so we can move it into the new thread
+        // Convert HANDLEs to isize so the worker owns only raw copies while ConfigWatcher keeps the
+        // actual handles alive until after the worker has been joined.
         let dir_handle_isize = dir_handle.0.0 as isize;
+        let changed_handle_isize = changed_event.0.0 as isize;
+        let stop_handle_isize = stop_event.0.0 as isize;
 
-        // Also initialize these variables so we move them into the new thread
         let config_name = config_path
             .file_name()
             .context("could not get config name for config watcher")?
             .to_owned()
             .into_string()
             .map_err(|_| anyhow!("could not convert config name for config watcher"))?;
+        let debounce_ms = debounce_time.min(u32::MAX as u64) as u32;
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
         let thread_handle = thread::spawn(move || unsafe {
             debug!("entering config watcher thread");
 
-            // Reconvert isize back to HANDLE
             let dir_handle = HANDLE(dir_handle_isize as _);
+            let changed_event = HANDLE(changed_handle_isize as _);
+            let stop_event = HANDLE(stop_handle_isize as _);
+            let events = [changed_event, stop_event];
+            const WAIT_OBJECT_1: WAIT_EVENT = WAIT_EVENT(WAIT_OBJECT_0.0 + 1);
 
             let mut buffer = [0u8; 1024];
-            let mut bytes_returned = 0u32;
 
             loop {
-                if stop_clone.load(Ordering::Acquire) {
-                    break;
-                }
+                let mut overlapped = OVERLAPPED {
+                    hEvent: changed_event,
+                    ..Default::default()
+                };
 
-                if let Err(e) = ReadDirectoryChangesW(
+                if let Err(err) = ReadDirectoryChangesW(
                     dir_handle,
                     buffer.as_mut_ptr() as _,
                     buffer.len() as u32,
                     false,
                     FILE_NOTIFY_CHANGE_LAST_WRITE,
-                    Some(ptr::addr_of_mut!(bytes_returned)),
                     None,
+                    Some(ptr::addr_of_mut!(overlapped)),
                     None,
                 ) {
-                    if !stop_clone.load(Ordering::Acquire) {
-                        error!("could not check for changes in config dir: {e}");
-                    }
+                    error!("could not arm config directory watcher: {err}");
+                    break;
+                }
+
+                let wait_result = WaitForMultipleObjects(&events, false, INFINITE);
+                if wait_result == WAIT_OBJECT_1 {
+                    // The buffer and OVERLAPPED live on this worker stack. Cancel and drain the
+                    // exact request before either can be dropped.
+                    let _ = CancelIoEx(dir_handle, Some(ptr::addr_of!(overlapped)));
+                    let mut ignored = 0u32;
+                    let _ = GetOverlappedResult(
+                        dir_handle,
+                        ptr::addr_of!(overlapped),
+                        ptr::addr_of_mut!(ignored),
+                        true,
+                    );
+                    break;
+                }
+
+                if wait_result != WAIT_OBJECT_0 {
+                    error!("could not wait for config directory changes: {wait_result:?}");
+                    let _ = CancelIoEx(dir_handle, Some(ptr::addr_of!(overlapped)));
+                    let mut ignored = 0u32;
+                    let _ = GetOverlappedResult(
+                        dir_handle,
+                        ptr::addr_of!(overlapped),
+                        ptr::addr_of_mut!(ignored),
+                        true,
+                    );
+                    break;
+                }
+
+                let mut bytes_returned = 0u32;
+                if let Err(err) = GetOverlappedResult(
+                    dir_handle,
+                    ptr::addr_of!(overlapped),
+                    ptr::addr_of_mut!(bytes_returned),
+                    false,
+                ) {
+                    error!("could not complete config directory read: {err}");
                     break;
                 }
 
                 Self::process_dir_change_notifs(&buffer, bytes_returned, &config_name, callback_fn);
-                if stop_clone.load(Ordering::Acquire) {
+
+                // Keep debounce interruptible by the same stop event. There is no pending I/O in
+                // this interval, so a stop can exit immediately without any cancellation step.
+                let debounce_result = WaitForSingleObject(stop_event, debounce_ms);
+                if debounce_result == WAIT_OBJECT_0 {
                     break;
                 }
-
-                // park_timeout keeps the debounce interruptible during shutdown; Drop unparks this
-                // thread after setting stop so disabling watch_config_changes does not wait 500ms.
-                thread::park_timeout(time::Duration::from_millis(debounce_time));
+                if debounce_result != WAIT_TIMEOUT {
+                    error!("could not wait during config watcher debounce: {debounce_result:?}");
+                    break;
+                }
             }
 
             debug!("exiting config watcher thread");
@@ -625,7 +755,8 @@ impl ConfigWatcher {
 
         Ok(Self {
             dir_handle,
-            stop,
+            _changed_event: changed_event,
+            stop_event,
             thread_handle: Some(thread_handle),
         })
     }
@@ -665,20 +796,17 @@ impl ConfigWatcher {
 
 impl Drop for ConfigWatcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-
-        // If ReadDirectoryChangesW is blocked, CancelIoEx wakes it. If the worker is between reads
-        // (for example inside the debounce), the stop flag + unpark path handles shutdown instead.
-        if let Err(err) = unsafe { CancelIoEx(self.dir_handle.0, None) } {
-            debug!(
-                "could not cancel config watcher i/o on {:?}: {err:#}",
-                self.dir_handle.0
-            );
+        // stop_event is manual-reset, so even if the worker has not armed its next overlapped read
+        // yet it will observe the stop as soon as it reaches WaitForMultipleObjects.
+        if let Err(err) = unsafe { SetEvent(self.stop_event.0) } {
+            error!("could not signal config watcher stop event: {err:#}");
+            // This is only a fallback for an invalid stop-event failure. With a valid event the
+            // worker cancels its own exact OVERLAPPED request.
+            let _ = unsafe { CancelIoEx(self.dir_handle.0, None) };
         }
 
         match self.thread_handle.take() {
             Some(handle) => {
-                handle.thread().unpark();
                 if let Err(err) = handle.join() {
                     error!("could not join config watcher thread handle: {err:?}");
                 }

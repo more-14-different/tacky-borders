@@ -25,7 +25,7 @@ use anyhow::{Context, anyhow};
 use border_runtime::{
     request_destroy_all_borders, request_graphics_refresh, request_reload_borders,
 };
-use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback};
+use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback, show_config_error_once};
 use ipc::IpcServer;
 use komorebi::KomorebiIntegration;
 use render_backend::RenderBackendConfig;
@@ -109,9 +109,7 @@ impl AppState {
             Ok(config) => config,
             Err(err) => {
                 eprintln!("could not read config: {err:#}");
-                thread::spawn(move || {
-                    display_error_box(format!("could not read config: {err:#}"), None);
-                });
+                show_config_error_once(format!("could not read config: {err:#}"));
 
                 Config::default()
             }

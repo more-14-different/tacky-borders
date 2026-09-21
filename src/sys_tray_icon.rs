@@ -5,7 +5,7 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
 use crate::auto_start::{is_autostart_enabled, toggle_autostart};
-use crate::config::{Config, request_config_reload};
+use crate::config::{Config, begin_config_shutdown, request_config_reload};
 use crate::utils::LogIfErr;
 use crate::{BG_SERVICES, destroy_borders};
 
@@ -62,6 +62,9 @@ pub fn create_tray_icon(hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon
         "2" => request_config_reload(),
         // Close
         "3" => {
+            // Stop and join config management first so no late reload can recreate services or
+            // borders after teardown has started.
+            begin_config_shutdown();
             destroy_borders();
 
             // Convert hwineventhook_isize back into HWINEVENTHOOK, and unhook it
