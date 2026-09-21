@@ -588,6 +588,51 @@ pub struct CompletionPort(HANDLE);
 
 unsafe impl Send for CompletionPort {}
 
+#[derive(Debug, Clone, Copy)]
+struct CompletionPortHandle(HANDLE);
+
+// This is a borrowed handle only. CompletionPort remains the unique owner and closes the HANDLE
+// after the worker has been joined.
+unsafe impl Send for CompletionPortHandle {}
+
+impl CompletionPortHandle {
+    fn associate_handle(&self, handle: HANDLE, token: usize) -> io::Result<()> {
+        let _ = unsafe { CreateIoCompletionPort(handle, Some(self.0), token, 0) }?;
+        Ok(())
+    }
+
+    fn poll_many(
+        &self,
+        timeout: Option<time::Duration>,
+        entries: &mut [OVERLAPPED_ENTRY],
+    ) -> io::Result<u32> {
+        let mut num_entries_removed = 0u32;
+        let timeout_ms = match timeout {
+            Some(duration) => duration.as_millis() as u32,
+            None => INFINITE,
+        };
+
+        let result = unsafe {
+            GetQueuedCompletionStatusEx(
+                self.0,
+                entries,
+                &mut num_entries_removed,
+                timeout_ms,
+                false,
+            )
+        };
+        if result.is_err() {
+            let err = io::Error::last_os_error();
+            if timeout.is_some() && err.raw_os_error() == Some(WAIT_TIMEOUT.0 as i32) {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+
+        Ok(num_entries_removed)
+    }
+}
+
 impl CompletionPort {
     pub fn new(threads: u32) -> io::Result<Self> {
         let iocp_handle =
@@ -597,10 +642,11 @@ impl CompletionPort {
     }
 
     pub fn associate_handle(&self, handle: HANDLE, token: usize) -> io::Result<()> {
-        // This just returns the HANDLE of the existing iocp, so we can ignore the return value
-        let _ = unsafe { CreateIoCompletionPort(handle, Some(self.0), token, 0) }?;
+        self.borrowed_handle().associate_handle(handle, token)
+    }
 
-        Ok(())
+    fn borrowed_handle(&self) -> CompletionPortHandle {
+        CompletionPortHandle(self.0)
     }
 
     pub fn poll_single(
@@ -642,31 +688,7 @@ impl CompletionPort {
         timeout: Option<time::Duration>,
         entries: &mut [OVERLAPPED_ENTRY],
     ) -> io::Result<u32> {
-        let mut num_entries_removed = 0u32;
-
-        let timeout_ms = match timeout {
-            Some(duration) => duration.as_millis() as u32,
-            None => INFINITE,
-        };
-
-        let result = unsafe {
-            GetQueuedCompletionStatusEx(
-                self.0,
-                entries,
-                &mut num_entries_removed,
-                timeout_ms,
-                false,
-            )
-        };
-        if result.is_err() {
-            let err = io::Error::last_os_error();
-            if timeout.is_some() && err.raw_os_error() == Some(WAIT_TIMEOUT.0 as i32) {
-                return Ok(0);
-            }
-            return Err(err);
-        }
-
-        Ok(num_entries_removed)
+        self.borrowed_handle().poll_many(timeout, entries)
     }
 }
 
@@ -700,8 +722,9 @@ impl AsWin32Socket for UnixDomainSocket {
 }
 
 pub struct UnixStreamSink {
-    iocp_handle: HANDLE,
+    port: Option<CompletionPort>,
     stop: Arc<AtomicBool>,
+    preserve_port: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
 }
 
@@ -717,7 +740,7 @@ impl UnixStreamSink {
 
     fn queue_accept(
         listener: &UnixListener,
-        port: &CompletionPort,
+        port: CompletionPortHandle,
         streams_queue: &mut VecDeque<(usize, Box<UnixStream>)>,
     ) -> anyhow::Result<()> {
         let stream =
@@ -743,13 +766,18 @@ impl UnixStreamSink {
         let listener = UnixListener::bind(socket_path).context("could not bind listener")?;
         let listener_key = listener.token();
 
+        // UnixStreamSink remains the sole owner of the completion-port HANDLE. The worker receives
+        // only a borrowed, non-closing copy and is joined before the owner is dropped. This removes
+        // the stale raw-HANDLE window that existed when the worker used to own and close the port.
         let port = CompletionPort::new(2).context("could not create iocp")?;
         port.associate_handle(listener.socket.to_handle(), listener_key)
             .context("could not associate listener with iocp")?;
+        let worker_port = port.borrowed_handle();
 
-        let iocp_handle = port.as_win32_handle();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let preserve_port = Arc::new(AtomicBool::new(false));
+        let preserve_port_worker = preserve_port.clone();
 
         let thread_handle = thread::spawn(move || {
             debug!("entering unix stream sink thread");
@@ -765,7 +793,7 @@ impl UnixStreamSink {
             // unwinding from the user callback therefore cannot drop listener/stream OVERLAPPED
             // storage before the common cleanup epilogue has canceled and drained it.
             let run_result = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<()> {
-                Self::queue_accept(&listener, &port, &mut streams_queue)?;
+                Self::queue_accept(&listener, worker_port, &mut streams_queue)?;
                 let mut should_cleanup = false;
 
                 loop {
@@ -777,9 +805,10 @@ impl UnixStreamSink {
 
                     // Use a finite poll so the shared stop flag is still an escape path if
                     // posting the dedicated stop packet ever fails.
-                    num_dequeued_entries =
-                        port.poll_many(Some(Self::STOP_POLL_INTERVAL), &mut entries)
-                            .context("could not poll with iocp")? as usize;
+                    num_dequeued_entries = worker_port
+                        .poll_many(Some(Self::STOP_POLL_INTERVAL), &mut entries)
+                        .context("could not poll with iocp")?
+                        as usize;
                     next_dequeued_entry = 0;
 
                     while next_dequeued_entry < num_dequeued_entries {
@@ -815,7 +844,7 @@ impl UnixStreamSink {
                                 return Err(err).context("could not read with stream");
                             }
 
-                            Self::queue_accept(&listener, &port, &mut streams_queue)?;
+                            Self::queue_accept(&listener, worker_port, &mut streams_queue)?;
                         } else if completion_key != Self::STOP_PACKET_KEY {
                             // Stream has been read; ready to process. Its completion has already
                             // been dequeued, so the local stream is safe to drop even if callback
@@ -855,7 +884,8 @@ impl UnixStreamSink {
             let cleanup_result = Self::cleanup(
                 listener,
                 listener_key,
-                port,
+                worker_port,
+                &preserve_port_worker,
                 entries,
                 next_dequeued_entry,
                 num_dequeued_entries,
@@ -880,8 +910,9 @@ impl UnixStreamSink {
         });
 
         Ok(Self {
-            iocp_handle,
+            port: Some(port),
             stop,
+            preserve_port,
             thread_handle: Some(thread_handle),
         })
     }
@@ -889,7 +920,8 @@ impl UnixStreamSink {
     fn cleanup(
         listener: UnixListener,
         listener_key: usize,
-        port: CompletionPort,
+        port: CompletionPortHandle,
+        preserve_port: &AtomicBool,
         mut entries: Vec<OVERLAPPED_ENTRY>,
         next_dequeued_entry: usize,
         num_dequeued_entries: usize,
@@ -912,8 +944,8 @@ impl UnixStreamSink {
             let Some(position) = position else {
                 return Err(Self::preserve_pending_io_on_cleanup_failure(
                     listener,
-                    port,
                     streams_queue,
+                    preserve_port,
                     anyhow::Error::msg(format!(
                         "could not find completion key {key} in partially processed iocp batch"
                     )),
@@ -922,15 +954,14 @@ impl UnixStreamSink {
             let _ = streams_queue.remove(position);
         }
 
-        // Cancel any pending I/O operations on the listener
+        // Cancel any pending I/O operations on the listener.
         let listener_handle = listener.socket.to_handle();
         unsafe { CancelIoEx(listener_handle, None) }
             .with_context(|| format!("could not cancel i/o for listener {listener_handle:?}"))
             .log_if_err();
 
-        // Cancel any pending I/O operations on each stream
-        // NOTE: A stream may not have any pending I/O operations if it is still in
-        // the accept stage, and CancelIoEx will return an error in those cases.
+        // Cancel any pending I/O operations on each stream. A stream may not have a pending read if
+        // it is still in the AcceptEx stage, so CancelIoEx can legitimately report no matching I/O.
         for (_, stream) in streams_queue.iter() {
             let stream_handle = stream.socket.to_handle();
             unsafe { CancelIoEx(stream_handle, None) }
@@ -947,8 +978,8 @@ impl UnixStreamSink {
                 Err(err) => {
                     return Err(Self::preserve_pending_io_on_cleanup_failure(
                         listener,
-                        port,
                         streams_queue,
+                        preserve_port,
                         anyhow::Error::new(err),
                     ));
                 }
@@ -970,8 +1001,8 @@ impl UnixStreamSink {
                 let Some(position) = position else {
                     return Err(Self::preserve_pending_io_on_cleanup_failure(
                         listener,
-                        port,
                         streams_queue,
+                        preserve_port,
                         anyhow::Error::msg(format!(
                             "could not find completion key {key} while draining canceled i/o"
                         )),
@@ -986,20 +1017,20 @@ impl UnixStreamSink {
 
     fn preserve_pending_io_on_cleanup_failure(
         listener: UnixListener,
-        port: CompletionPort,
         streams_queue: VecDeque<(usize, Box<UnixStream>)>,
+        preserve_port: &AtomicBool,
         err: anyhow::Error,
     ) -> anyhow::Error {
-        // Safety wins over cleanup completeness on a catastrophic IOCP-drain failure. If we can no
-        // longer prove that canceled operations completed, intentionally keep every object backing
-        // their OVERLAPPED pointers alive until process exit rather than risk use-after-free.
+        // Safety wins over cleanup completeness on a catastrophic IOCP-drain failure. The outer
+        // UnixStreamSink still owns the port; mark it for preservation, then intentionally keep
+        // every object backing pending OVERLAPPED pointers alive until process exit.
+        preserve_port.store(true, Ordering::Release);
         let preserved = anyhow::Error::msg(format!(
             "could not prove pending i/o completion; preserving listener, iocp, and pending \
 OVERLAPPED storage until process exit: {err:#}"
         ));
         mem::forget(streams_queue);
         mem::forget(listener);
-        mem::forget(port);
         preserved
     }
 }
@@ -1007,14 +1038,19 @@ OVERLAPPED storage until process exit: {err:#}"
 impl Drop for UnixStreamSink {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Err(err) =
-            unsafe { PostQueuedCompletionStatus(self.iocp_handle, 0, Self::STOP_PACKET_KEY, None) }
+
+        // The CompletionPort owner is guaranteed to remain alive until after this join. Posting the
+        // stop packet can therefore never target a HANDLE already closed by the worker.
+        if let Some(port) = self.port.as_ref()
+            && let Err(err) = unsafe {
+                PostQueuedCompletionStatus(port.as_win32_handle(), 0, Self::STOP_PACKET_KEY, None)
+            }
         {
             // The worker also polls the shared stop flag at a bounded interval, so a failed stop
             // packet cannot orphan the JoinHandle.
             error!(
                 "could not post stop packet to iocp {:?} for unix stream sink: {err:#}",
-                self.iocp_handle
+                port.as_win32_handle()
             );
         }
 
@@ -1025,6 +1061,14 @@ impl Drop for UnixStreamSink {
                 }
             }
             None => error!("could not take unix stream sink thread handle"),
+        }
+
+        if self.preserve_port.load(Ordering::Acquire)
+            && let Some(port) = self.port.take()
+        {
+            // The worker could not prove every canceled operation completed. Keep the IOCP alive
+            // with the intentionally leaked pending OVERLAPPED backing storage until process exit.
+            mem::forget(port);
         }
     }
 }

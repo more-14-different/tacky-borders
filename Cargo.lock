@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "tacky-borders"
-version = "1.6.1-runtime.6"
+version = "1.6.1-runtime.7"
 dependencies = [
  "anyhow",
  "dirs",

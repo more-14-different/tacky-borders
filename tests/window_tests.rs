@@ -60,6 +60,10 @@ fn test_destroy_borders() -> anyhow::Result<()> {
 
     for _ in 0..5 {
         create_borders_for_existing_windows()?;
+        // Snapshot is a FIFO runtime-command barrier: create work posted before it has been
+        // consumed before destroy is queued. Do not assert a nonzero count because CI may not have
+        // any eligible top-level windows.
+        let _ = runtime_snapshot()?;
         destroy_borders();
         wait_for_border_count(0)?;
 
@@ -76,9 +80,12 @@ fn test_reload_borders() -> anyhow::Result<()> {
     register_border_window_class()?;
     let _runtime = BorderRuntimeHost::new()?;
     create_borders_for_existing_windows()?;
+    let _ = runtime_snapshot()?;
 
     for _ in 0..5 {
         reload_borders();
+        // Guarantee each reload command completed before the next cycle is queued.
+        let _ = runtime_snapshot()?;
     }
     destroy_borders();
     wait_for_border_count(0)?;
@@ -95,6 +102,7 @@ fn test_runtime_snapshot_after_destroy() -> anyhow::Result<()> {
     let _runtime = BorderRuntimeHost::new()?;
 
     create_borders_for_existing_windows()?;
+    let _ = runtime_snapshot()?;
     destroy_borders();
     assert_eq!(wait_for_border_count(0)?.border_count, 0);
 

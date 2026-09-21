@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -149,8 +149,17 @@ impl KomorebiIntegration {
         buffer: &[u8],
         bytes_received: u32,
     ) {
-        let notification: serde_json_borrow::Value =
-            match serde_json::from_slice(&buffer[..bytes_received as usize]) {
+        let bytes_received = bytes_received as usize;
+        if bytes_received > buffer.len() {
+            error!(
+                "komorebi notification length {bytes_received} exceeds receive buffer {}",
+                buffer.len()
+            );
+            return;
+        }
+
+        let notification: serde_json_borrow::Value<'_> =
+            match serde_json::from_slice(&buffer[..bytes_received]) {
                 Ok(event) => event,
                 Err(err) => {
                     error!("could not parse unix domain socket buffer: {err:#}");
@@ -159,125 +168,31 @@ impl KomorebiIntegration {
             };
 
         let previous_focus_state = (*focus_state_mutex.lock().unwrap()).clone();
-
-        let monitors = notification.get("state").get("monitors");
-        let focused_monitor_idx = monitors.get("focused").as_u64().unwrap() as usize;
         let foreground_window = get_foreground_window();
-
-        for (monitor_idx, m) in monitors
-            .get("elements")
-            .as_array()
-            .unwrap()
-            .iter()
-            .enumerate()
-        {
-            // Only operate on the focused workspace of each monitor
-            if let Some(ws) = m
-                .get("workspaces")
-                .get("elements")
-                .as_array()
-                .unwrap()
-                .get(m.get("workspaces").get("focused").as_u64().unwrap() as usize)
-            {
-                // Handle the monocle container separately
-                let monocle = ws.get("monocle_container");
-                if !monocle.is_null() {
-                    let new_focus_state = if monitor_idx != focused_monitor_idx {
-                        WindowKind::Unfocused
-                    } else {
-                        WindowKind::Monocle
-                    };
-
-                    {
-                        // If this is a monocole, I assume there's only 1 window in "windows"
-                        let tracking_hwnd =
-                            monocle.get("windows").get("elements").as_array().unwrap()[0]
-                                .get("hwnd")
-                                .as_i64()
-                                .unwrap() as isize;
-                        let mut focus_state = focus_state_mutex.lock().unwrap();
-                        let _ = focus_state.insert(tracking_hwnd, new_focus_state);
-                    }
-                }
-
-                let foreground_hwnd = get_foreground_window();
-
-                for (idx, c) in ws
-                    .get("containers")
-                    .get("elements")
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .enumerate()
-                {
-                    let new_focus_state = if idx
-                        != ws.get("containers").get("focused").as_i64().unwrap() as usize
-                        || monitor_idx != focused_monitor_idx
-                        || c.get("windows")
-                            .get("elements")
-                            .as_array()
-                            .unwrap()
-                            .get(c.get("windows").get("focused").as_u64().unwrap() as usize)
-                            .map(|w| {
-                                w.get("hwnd").as_i64().unwrap() as isize
-                                    != foreground_hwnd.0 as isize
-                            })
-                            .unwrap_or_default()
-                    {
-                        WindowKind::Unfocused
-                    } else if c.get("windows").get("elements").as_array().unwrap().len() > 1 {
-                        WindowKind::Stack
-                    } else {
-                        WindowKind::Single
-                    };
-
-                    // Update the window kind for all containers on this workspace
-                    {
-                        let tracking_hwnd = c.get("windows").get("elements").as_array().unwrap()
-                            [c.get("windows").get("focused").as_u64().unwrap() as usize]
-                            .get("hwnd")
-                            .as_i64()
-                            .unwrap() as isize;
-                        let mut focus_state = focus_state_mutex.lock().unwrap();
-                        let _ = focus_state.insert(tracking_hwnd, new_focus_state);
-                    }
-                }
-                {
-                    for window in ws
-                        .get("floating_windows")
-                        .get("elements")
-                        .as_array()
-                        .unwrap()
-                    {
-                        let mut new_focus_state = WindowKind::Unfocused;
-
-                        if foreground_window.0 as isize
-                            == window.get("hwnd").as_i64().unwrap() as isize
-                        {
-                            new_focus_state = WindowKind::Floating;
-                        }
-
-                        {
-                            let tracking_hwnd = window.get("hwnd").as_i64().unwrap() as isize;
-                            let mut focus_state = focus_state_mutex.lock().unwrap();
-                            let _ = focus_state.insert(tracking_hwnd, new_focus_state);
-                        }
-                    }
-                }
+        let next_focus_state = match Self::build_focus_state_from_notification(
+            &notification,
+            &previous_focus_state,
+            foreground_window,
+        ) {
+            Ok(state) => state,
+            Err(err) => {
+                // External komorebi data is allowed to be malformed or come from a newer schema.
+                // Reject the whole notification rather than panicking or publishing a partial map.
+                error!("could not interpret komorebi notification: {err:#}");
+                return;
             }
-        }
+        };
 
-        let new_focus_state = focus_state_mutex.lock().unwrap();
         let mut changed_tracking: Vec<isize> = previous_focus_state
             .keys()
-            .chain(new_focus_state.keys())
+            .chain(next_focus_state.keys())
             .copied()
             .collect();
         changed_tracking.sort_unstable();
         changed_tracking.dedup();
         changed_tracking.retain(|tracking| {
             let previous_window_kind = previous_focus_state.get(tracking);
-            let new_window_kind = new_focus_state.get(tracking);
+            let new_window_kind = next_focus_state.get(tracking);
             if previous_window_kind == new_window_kind {
                 return false;
             }
@@ -291,11 +206,160 @@ impl KomorebiIntegration {
                 Some(WindowKind::Single) | Some(WindowKind::Unfocused)
             ))
         });
-        drop(new_focus_state);
+
+        *focus_state_mutex.lock().unwrap() = next_focus_state;
 
         // Runtime filters this list against its private registry, so komorebi never needs border
         // HWNDs or registry access of its own.
         request_komorebi_refresh(changed_tracking);
+    }
+
+    fn build_focus_state_from_notification<'ctx>(
+        notification: &'ctx serde_json_borrow::Value<'ctx>,
+        previous_focus_state: &HashMap<isize, WindowKind>,
+        foreground_window: HWND,
+    ) -> anyhow::Result<HashMap<isize, WindowKind>> {
+        let monitors = notification.get("state").get("monitors");
+        let monitor_elements = monitors
+            .get("elements")
+            .as_array()
+            .context("state.monitors.elements is not an array")?;
+        let focused_monitor_idx =
+            Self::komorebi_index(monitors.get("focused"), "state.monitors.focused")?;
+        if focused_monitor_idx >= monitor_elements.len() {
+            return Err(anyhow!(
+                "state.monitors.focused index {focused_monitor_idx} is out of bounds for {} monitors",
+                monitor_elements.len()
+            ));
+        }
+
+        let mut next_focus_state = previous_focus_state.clone();
+
+        for (monitor_idx, monitor) in monitor_elements.iter().enumerate() {
+            let workspaces = monitor.get("workspaces");
+            let workspace_elements = workspaces
+                .get("elements")
+                .as_array()
+                .context("monitor.workspaces.elements is not an array")?;
+            if workspace_elements.is_empty() {
+                continue;
+            }
+            let focused_workspace_idx =
+                Self::komorebi_index(workspaces.get("focused"), "monitor.workspaces.focused")?;
+            let workspace = workspace_elements.get(focused_workspace_idx).with_context(|| {
+                format!(
+                    "monitor.workspaces.focused index {focused_workspace_idx} is out of bounds for {} workspaces",
+                    workspace_elements.len()
+                )
+            })?;
+
+            let monocle = workspace.get("monocle_container");
+            if !monocle.is_null() {
+                let windows = monocle
+                    .get("windows")
+                    .get("elements")
+                    .as_array()
+                    .context("monocle_container.windows.elements is not an array")?;
+                let window = windows
+                    .first()
+                    .context("monocle_container.windows.elements is empty")?;
+                let tracking_hwnd = Self::komorebi_hwnd(
+                    window.get("hwnd"),
+                    "monocle_container.windows.elements[0].hwnd",
+                )?;
+                let new_kind = if monitor_idx != focused_monitor_idx {
+                    WindowKind::Unfocused
+                } else {
+                    WindowKind::Monocle
+                };
+                next_focus_state.insert(tracking_hwnd, new_kind);
+            }
+
+            let containers = workspace.get("containers");
+            let container_elements = containers
+                .get("elements")
+                .as_array()
+                .context("workspace.containers.elements is not an array")?;
+            let focused_container_idx = if container_elements.is_empty() {
+                None
+            } else {
+                let index = Self::komorebi_index(
+                    containers.get("focused"),
+                    "workspace.containers.focused",
+                )?;
+                if index >= container_elements.len() {
+                    return Err(anyhow!(
+                        "workspace.containers.focused index {index} is out of bounds for {} containers",
+                        container_elements.len()
+                    ));
+                }
+                Some(index)
+            };
+
+            for (container_idx, container) in container_elements.iter().enumerate() {
+                let windows = container.get("windows");
+                let window_elements = windows
+                    .get("elements")
+                    .as_array()
+                    .context("container.windows.elements is not an array")?;
+                let focused_window_idx =
+                    Self::komorebi_index(windows.get("focused"), "container.windows.focused")?;
+                let focused_window = window_elements.get(focused_window_idx).with_context(|| {
+                    format!(
+                        "container.windows.focused index {focused_window_idx} is out of bounds for {} windows",
+                        window_elements.len()
+                    )
+                })?;
+                let tracking_hwnd = Self::komorebi_hwnd(
+                    focused_window.get("hwnd"),
+                    "container focused window hwnd",
+                )?;
+
+                let new_kind = if Some(container_idx) != focused_container_idx
+                    || monitor_idx != focused_monitor_idx
+                    || tracking_hwnd != foreground_window.0 as isize
+                {
+                    WindowKind::Unfocused
+                } else if window_elements.len() > 1 {
+                    WindowKind::Stack
+                } else {
+                    WindowKind::Single
+                };
+                next_focus_state.insert(tracking_hwnd, new_kind);
+            }
+
+            let floating_windows = workspace
+                .get("floating_windows")
+                .get("elements")
+                .as_array()
+                .context("workspace.floating_windows.elements is not an array")?;
+            for window in floating_windows {
+                let tracking_hwnd =
+                    Self::komorebi_hwnd(window.get("hwnd"), "floating window hwnd")?;
+                let new_kind = if tracking_hwnd == foreground_window.0 as isize {
+                    WindowKind::Floating
+                } else {
+                    WindowKind::Unfocused
+                };
+                next_focus_state.insert(tracking_hwnd, new_kind);
+            }
+        }
+
+        Ok(next_focus_state)
+    }
+
+    fn komorebi_index(value: &serde_json_borrow::Value<'_>, field: &str) -> anyhow::Result<usize> {
+        let value = value
+            .as_u64()
+            .with_context(|| format!("{field} is not an unsigned integer"))?;
+        usize::try_from(value).with_context(|| format!("{field} is out of range"))
+    }
+
+    fn komorebi_hwnd(value: &serde_json_borrow::Value<'_>, field: &str) -> anyhow::Result<isize> {
+        let value = value
+            .as_i64()
+            .with_context(|| format!("{field} is not a signed integer"))?;
+        isize::try_from(value).with_context(|| format!("{field} is out of range"))
     }
 }
 
@@ -311,5 +375,29 @@ impl Drop for KomorebiIntegration {
             }
             None => error!("could not take komorebi subscribe thread handle"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KomorebiIntegration, WindowKind};
+    use std::collections::HashMap;
+    use windows::Win32::Foundation::HWND;
+
+    #[test]
+    fn malformed_komorebi_schema_is_rejected_without_mutating_previous_state() {
+        let previous = HashMap::from([(0x1234isize, WindowKind::Single)]);
+        let notification: serde_json_borrow::Value<'_> =
+            serde_json::from_slice(br#"{"state":{"monitors":{"focused":0,"elements":[]}}}"#)
+                .expect("test notification should be valid json");
+
+        let result = KomorebiIntegration::build_focus_state_from_notification(
+            &notification,
+            &previous,
+            HWND::default(),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(previous.get(&0x1234), Some(&WindowKind::Single));
     }
 }
