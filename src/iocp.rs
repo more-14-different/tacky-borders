@@ -1,6 +1,7 @@
 use anyhow::Context;
 use std::collections::VecDeque;
 use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -714,6 +715,27 @@ impl UnixStreamSink {
     // below (INVALID_SOCKET) should work as a special key that won't interfere with others.
     const STOP_PACKET_KEY: usize = INVALID_SOCKET.0;
 
+    fn queue_accept(
+        listener: &UnixListener,
+        port: &CompletionPort,
+        streams_queue: &mut VecDeque<(usize, Box<UnixStream>)>,
+    ) -> anyhow::Result<()> {
+        let stream =
+            Box::new(unsafe { listener.accept_overlapped() }.context("could not accept stream")?);
+        let token = stream.token();
+
+        // Own the OVERLAPPED before the next fallible operation. If associating the accepted
+        // socket with the IOCP fails, exceptional-exit cleanup can still cancel and drain the
+        // pending AcceptEx request through the listener completion key.
+        streams_queue.push_back((token, stream));
+        let stream = streams_queue
+            .back()
+            .map(|(_, stream)| stream)
+            .context("could not get queued accept stream")?;
+        port.associate_handle(stream.socket.to_handle(), token)
+            .context("could not associate stream with iocp")
+    }
+
     pub fn new(
         socket_path: &Path,
         mut callback: impl FnMut(&[u8], u32) + Send + 'static,
@@ -732,20 +754,18 @@ impl UnixStreamSink {
         let thread_handle = thread::spawn(move || {
             debug!("entering unix stream sink thread");
 
-            move || -> anyhow::Result<()> {
-                let mut entries = vec![OVERLAPPED_ENTRY::default(); Self::MAX_COMPLETION_EVENTS];
-                let mut buffer_pool = VecDeque::<Vec<u8>>::new();
-                let mut streams_queue = VecDeque::<(usize, Box<UnixStream>)>::new();
-                let mut last_buffer_pool_prune = time::Instant::now();
+            let mut entries = vec![OVERLAPPED_ENTRY::default(); Self::MAX_COMPLETION_EVENTS];
+            let mut buffer_pool = VecDeque::<Vec<u8>>::new();
+            let mut streams_queue = VecDeque::<(usize, Box<UnixStream>)>::new();
+            let mut last_buffer_pool_prune = time::Instant::now();
+            let mut next_dequeued_entry = 0usize;
+            let mut num_dequeued_entries = 0usize;
 
-                // Queue up our first accept I/O operation.
-                let stream = Box::new(
-                    unsafe { listener.accept_overlapped() }.context("could not accept stream")?,
-                );
-                port.associate_handle(stream.socket.to_handle(), stream.token())
-                    .context("could not associate stream with iocp")?;
-                streams_queue.push_back((stream.token(), stream));
-
+            // Keep the ownership state outside the fallible run closure. Returning Err or
+            // unwinding from the user callback therefore cannot drop listener/stream OVERLAPPED
+            // storage before the common cleanup epilogue has canceled and drained it.
+            let run_result = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<()> {
+                Self::queue_accept(&listener, &port, &mut streams_queue)?;
                 let mut should_cleanup = false;
 
                 loop {
@@ -757,37 +777,52 @@ impl UnixStreamSink {
 
                     // Use a finite poll so the shared stop flag is still an escape path if
                     // posting the dedicated stop packet ever fails.
-                    let num_removed = port
-                        .poll_many(Some(Self::STOP_POLL_INTERVAL), &mut entries)
-                        .context("could not poll with iocp")?;
+                    num_dequeued_entries =
+                        port.poll_many(Some(Self::STOP_POLL_INTERVAL), &mut entries)
+                            .context("could not poll with iocp")? as usize;
+                    next_dequeued_entry = 0;
 
-                    for entry in entries[..num_removed as usize].iter() {
-                        if entry.lpCompletionKey == listener_key {
-                            // Stream has been accepted; ready to read
-                            let stream =
-                                &mut streams_queue.back_mut().context("could not get stream")?.1;
+                    while next_dequeued_entry < num_dequeued_entries {
+                        let entry = &entries[next_dequeued_entry];
+                        let completion_key = entry.lpCompletionKey;
+                        let bytes_transferred = entry.dwNumberOfBytesTransferred;
 
-                            // Attempt to retrieve a buffer from the bufferpool
-                            let outputbuffer = buffer_pool.pop_front().unwrap_or_else(|| {
-                                debug!("creating new buffer for unix stream sink");
-                                vec![0u8; Self::BUFFER_SIZE]
-                            });
-                            unsafe { stream.read_overlapped(outputbuffer) }
-                                .context("could not read with stream")?;
+                        // GetQueuedCompletionStatusEx has already removed this entry from the
+                        // port. Advance before running fallible code or the user callback so the
+                        // cleanup epilogue only accounts for entries later in this same batch.
+                        next_dequeued_entry += 1;
 
-                            // Queue up a new accept I/O operation.
-                            let stream = Box::new(
-                                unsafe { listener.accept_overlapped() }
-                                    .context("could not accept stream")?,
-                            );
-                            port.associate_handle(stream.socket.to_handle(), stream.token())
-                                .context("could not associate stream with iocp")?;
-                            streams_queue.push_back((stream.token(), stream));
-                        } else if entry.lpCompletionKey != Self::STOP_PACKET_KEY {
-                            // Stream has been read; ready to process
+                        if completion_key == listener_key {
+                            // Stream has been accepted; ready to read. The accepted stream is the
+                            // queue tail because only one AcceptEx is outstanding at a time.
+                            let read_result = {
+                                let stream = streams_queue
+                                    .back_mut()
+                                    .map(|(_, stream)| stream)
+                                    .context("could not get stream")?;
+                                let outputbuffer = buffer_pool.pop_front().unwrap_or_else(|| {
+                                    debug!("creating new buffer for unix stream sink");
+                                    vec![0u8; Self::BUFFER_SIZE]
+                                });
+                                unsafe { stream.read_overlapped(outputbuffer) }
+                            };
+
+                            if let Err(err) = read_result {
+                                // read_overlapped only returns Err for a non-pending WSARecv
+                                // failure. No completion will arrive for this stream, so remove it
+                                // from the pending queue before entering the common drain path.
+                                let _ = streams_queue.pop_back();
+                                return Err(err).context("could not read with stream");
+                            }
+
+                            Self::queue_accept(&listener, &port, &mut streams_queue)?;
+                        } else if completion_key != Self::STOP_PACKET_KEY {
+                            // Stream has been read; ready to process. Its completion has already
+                            // been dequeued, so the local stream is safe to drop even if callback
+                            // panics; all other pending streams remain owned by streams_queue.
                             let position = streams_queue
                                 .iter()
-                                .position(|(token, _)| *token == entry.lpCompletionKey)
+                                .position(|(token, _)| *token == completion_key)
                                 .context("could not find stream")?;
                             let mut stream = streams_queue
                                 .remove(position)
@@ -797,25 +832,49 @@ impl UnixStreamSink {
                                 .take_overlapped_buffer()
                                 .context("unix stream's buffer is None")?;
 
-                            callback(&outputbuffer, entry.dwNumberOfBytesTransferred);
-
-                            // We don't need this stream anymore, so place its buffer into the pool
+                            callback(&outputbuffer, bytes_transferred);
                             buffer_pool.push_back(outputbuffer);
                         } else {
-                            // Stop packet has been sent; cleanup and exit the thread
                             should_cleanup = true;
                         }
                     }
 
+                    next_dequeued_entry = 0;
+                    num_dequeued_entries = 0;
+
                     if should_cleanup || stop_clone.load(Ordering::Acquire) {
-                        Self::cleanup(listener, listener_key, port, entries, streams_queue)?;
                         break;
                     }
                 }
 
                 Ok(())
-            }()
-            .log_if_err();
+            }));
+
+            // This epilogue is intentionally unconditional. It runs after success, Result errors,
+            // and callback panics before the panic is resumed.
+            let cleanup_result = Self::cleanup(
+                listener,
+                listener_key,
+                port,
+                entries,
+                next_dequeued_entry,
+                num_dequeued_entries,
+                streams_queue,
+            );
+            if let Err(err) = cleanup_result {
+                error!("could not safely clean up unix stream sink worker: {err:#}");
+            }
+
+            match run_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => error!("unix stream sink worker failed: {err:#}"),
+                Err(payload) => {
+                    error!(
+                        "unix stream sink callback panicked after pending i/o lifetime was resolved"
+                    );
+                    resume_unwind(payload);
+                }
+            }
 
             debug!("exiting unix stream sink thread");
         });
@@ -832,8 +891,37 @@ impl UnixStreamSink {
         listener_key: usize,
         port: CompletionPort,
         mut entries: Vec<OVERLAPPED_ENTRY>,
+        next_dequeued_entry: usize,
+        num_dequeued_entries: usize,
         mut streams_queue: VecDeque<(usize, Box<UnixStream>)>,
     ) -> anyhow::Result<()> {
+        // A fallible operation or callback panic can stop processing partway through a batch
+        // returned by GetQueuedCompletionStatusEx. Those entries have already left the port, so
+        // account for them before waiting for any completions that remain queued in the kernel.
+        for entry in entries[next_dequeued_entry..num_dequeued_entries].iter() {
+            let key = entry.lpCompletionKey;
+            if key == Self::STOP_PACKET_KEY {
+                continue;
+            }
+            if key == listener_key {
+                let _ = streams_queue.pop_back();
+                continue;
+            }
+
+            let position = streams_queue.iter().position(|(token, _)| *token == key);
+            let Some(position) = position else {
+                return Err(Self::preserve_pending_io_on_cleanup_failure(
+                    listener,
+                    port,
+                    streams_queue,
+                    anyhow::Error::msg(format!(
+                        "could not find completion key {key} in partially processed iocp batch"
+                    )),
+                ));
+            };
+            let _ = streams_queue.remove(position);
+        }
+
         // Cancel any pending I/O operations on the listener
         let listener_handle = listener.socket.to_handle();
         unsafe { CancelIoEx(listener_handle, None) }
@@ -854,24 +942,65 @@ impl UnixStreamSink {
         // is intentionally no timeout here: timing out and dropping streams_queue would free memory
         // that the kernel may still reference.
         while !streams_queue.is_empty() {
-            let num_removed = port
-                .poll_many(None, &mut entries)
-                .context("could not drain canceled i/o from iocp")?;
+            let num_removed = match port.poll_many(None, &mut entries) {
+                Ok(num_removed) => num_removed,
+                Err(err) => {
+                    return Err(Self::preserve_pending_io_on_cleanup_failure(
+                        listener,
+                        port,
+                        streams_queue,
+                        anyhow::Error::new(err),
+                    ));
+                }
+            };
 
             for entry in entries[..num_removed as usize].iter() {
-                if entry.lpCompletionKey == listener_key {
-                    let _ = streams_queue.pop_back();
-                } else {
-                    let position = streams_queue
-                        .iter()
-                        .position(|(token, _)| *token == entry.lpCompletionKey)
-                        .context("could not find completion key")?;
-                    let _ = streams_queue.remove(position);
+                let key = entry.lpCompletionKey;
+                if key == Self::STOP_PACKET_KEY {
+                    // A stop packet can race the shared stop-flag fallback and arrive after the
+                    // worker has already entered cleanup. It owns no OVERLAPPED storage.
+                    continue;
                 }
+                if key == listener_key {
+                    let _ = streams_queue.pop_back();
+                    continue;
+                }
+
+                let position = streams_queue.iter().position(|(token, _)| *token == key);
+                let Some(position) = position else {
+                    return Err(Self::preserve_pending_io_on_cleanup_failure(
+                        listener,
+                        port,
+                        streams_queue,
+                        anyhow::Error::msg(format!(
+                            "could not find completion key {key} while draining canceled i/o"
+                        )),
+                    ));
+                };
+                let _ = streams_queue.remove(position);
             }
         }
 
         Ok(())
+    }
+
+    fn preserve_pending_io_on_cleanup_failure(
+        listener: UnixListener,
+        port: CompletionPort,
+        streams_queue: VecDeque<(usize, Box<UnixStream>)>,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        // Safety wins over cleanup completeness on a catastrophic IOCP-drain failure. If we can no
+        // longer prove that canceled operations completed, intentionally keep every object backing
+        // their OVERLAPPED pointers alive until process exit rather than risk use-after-free.
+        let preserved = anyhow::Error::msg(format!(
+            "could not prove pending i/o completion; preserving listener, iocp, and pending \
+OVERLAPPED storage until process exit: {err:#}"
+        ));
+        mem::forget(streams_queue);
+        mem::forget(listener);
+        mem::forget(port);
+        preserved
     }
 }
 

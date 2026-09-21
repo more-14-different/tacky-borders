@@ -1,6 +1,6 @@
 [package]
 name = "tacky-borders"
-version = "1.6.1-runtime.5"
+version = "1.6.1-runtime.6"
 edition = "2024"
 
 [dependencies]

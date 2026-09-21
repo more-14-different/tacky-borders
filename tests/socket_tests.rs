@@ -1,4 +1,9 @@
 use std::io::{Read, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use anyhow::Context;
@@ -127,6 +132,39 @@ fn test_unix_stream_sink_shutdown_with_pending_io() -> anyhow::Result<()> {
         drop(client);
         remove_file_if_exists(&socket_path).context("could not remove sink test socket")?;
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_unix_stream_sink_callback_panic_cleans_pending_io() -> anyhow::Result<()> {
+    let socket_path =
+        std::env::temp_dir().join(format!("tb-sink-panic-{}.sock", std::process::id()));
+    remove_file_if_exists(&socket_path).context("could not remove stale panic-test socket")?;
+
+    let callback_ran = Arc::new(AtomicBool::new(false));
+    let callback_ran_worker = callback_ran.clone();
+    let sink = UnixStreamSink::new(&socket_path, move |_buffer, _bytes_received| {
+        callback_ran_worker.store(true, Ordering::Release);
+        panic!("intentional unix stream sink callback panic");
+    })?;
+    let mut client = UnixStream::connect(&socket_path)?;
+    client.write_all(b"trigger callback panic")?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !callback_ran.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        callback_ran.load(Ordering::Acquire),
+        "unix stream sink callback did not run before timeout"
+    );
+
+    // The callback panics while a trailing AcceptEx is normally pending. Drop joins the worker;
+    // the worker must cancel+drain that pending operation before resuming the panic.
+    drop(sink);
+    drop(client);
+    remove_file_if_exists(&socket_path).context("could not remove panic-test socket")?;
 
     Ok(())
 }
