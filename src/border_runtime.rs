@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVIC
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, EnumWindows, GWLP_USERDATA,
-    GetWindowLongPtrW, HWND_MESSAGE, KillTimer, RegisterClassExW, SetTimer, SetWindowLongPtrW,
-    WM_APP, WM_CREATE, WM_NCDESTROY, WM_TIMER, WNDCLASSEXW,
+    GetWindowLongPtrW, HWND_MESSAGE, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer,
+    SetWindowLongPtrW, WM_APP, WM_CREATE, WM_NCDESTROY, WM_TIMER, WNDCLASSEXW,
 };
 use windows::core::{BOOL, HRESULT, w};
 
@@ -153,6 +153,7 @@ enum BorderRuntimeCommand {
     Snapshot {
         reply: SyncSender<BorderRuntimeSnapshot>,
     },
+    FinalizeShutdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,6 +544,12 @@ pub fn request_runtime_snapshot() -> anyhow::Result<BorderRuntimeSnapshot> {
         .context("timed out waiting for border runtime snapshot")
 }
 
+/// Final teardown is serialized on the runtime/UI thread after all background producers have
+/// stopped. This preserves the DestroyWindow thread-affinity invariant through process exit.
+pub fn request_finalize_shutdown() {
+    post_runtime_command_logged(BorderRuntimeCommand::FinalizeShutdown);
+}
+
 impl BorderRuntime {
     unsafe extern "system" fn s_wnd_proc(
         window: HWND,
@@ -621,6 +628,10 @@ impl BorderRuntime {
             } => self.apply_border_update(update, focused_only),
             BorderRuntimeCommand::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
+            }
+            BorderRuntimeCommand::FinalizeShutdown => {
+                self.destroy_all_borders();
+                unsafe { PostQuitMessage(0) };
             }
         }
     }

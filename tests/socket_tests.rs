@@ -3,7 +3,7 @@ use std::{fs, thread};
 
 use anyhow::Context;
 use tacky_borders::config::Config;
-use tacky_borders::iocp::{CompletionPort, UnixListener, UnixStream};
+use tacky_borders::iocp::{CompletionPort, UnixListener, UnixStream, UnixStreamSink};
 use tacky_borders::utils::remove_file_if_exists;
 use windows::Win32::System::IO::OVERLAPPED_ENTRY;
 
@@ -107,6 +107,26 @@ fn test_socket_write_read() -> anyhow::Result<()> {
 
     assert!(bytes_read == correct_output.len());
     assert!(output_buffer == correct_output);
+
+    Ok(())
+}
+
+#[test]
+fn test_unix_stream_sink_shutdown_with_pending_io() -> anyhow::Result<()> {
+    let socket_path =
+        std::env::temp_dir().join(format!("tb-sink-shutdown-{}.sock", std::process::id()));
+
+    for _ in 0..20 {
+        remove_file_if_exists(&socket_path).context("could not remove stale sink test socket")?;
+        let sink = UnixStreamSink::new(&socket_path, |_buffer, _bytes_received| {})?;
+        let client = UnixStream::connect(&socket_path)?;
+
+        // Keep the client open while dropping the sink so cleanup must resolve any pending accept
+        // and/or read OVERLAPPED requests before their backing allocations are released.
+        drop(sink);
+        drop(client);
+        remove_file_if_exists(&socket_path).context("could not remove sink test socket")?;
+    }
 
     Ok(())
 }

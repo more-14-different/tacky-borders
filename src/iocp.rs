@@ -2,10 +2,14 @@ use anyhow::Context;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time;
 use std::{io, mem, ptr};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_UNIX, AcceptEx, INVALID_SOCKET, SEND_RECV_FLAGS, SO_RCVTIMEO, SO_SNDTIMEO,
     SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOL_SOCKET, SOMAXCONN,
@@ -644,7 +648,7 @@ impl CompletionPort {
             None => INFINITE,
         };
 
-        unsafe {
+        let result = unsafe {
             GetQueuedCompletionStatusEx(
                 self.0,
                 entries,
@@ -652,7 +656,14 @@ impl CompletionPort {
                 timeout_ms,
                 false,
             )
-        }?;
+        };
+        if result.is_err() {
+            let err = io::Error::last_os_error();
+            if timeout.is_some() && err.raw_os_error() == Some(WAIT_TIMEOUT.0 as i32) {
+                return Ok(0);
+            }
+            return Err(err);
+        }
 
         Ok(num_entries_removed)
     }
@@ -689,12 +700,14 @@ impl AsWin32Socket for UnixDomainSocket {
 
 pub struct UnixStreamSink {
     iocp_handle: HANDLE,
+    stop: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
 }
 
 impl UnixStreamSink {
     const MAX_COMPLETION_EVENTS: usize = 8;
     const BUFFER_POOL_PRUNE_INTERVAL: time::Duration = time::Duration::from_secs(600);
+    const STOP_POLL_INTERVAL: time::Duration = time::Duration::from_millis(250);
     const BUFFER_SIZE: usize = 32768;
 
     // Currently, tokens/keys are just the values of the corresponding SOCKETs, which is why the value
@@ -713,6 +726,8 @@ impl UnixStreamSink {
             .context("could not associate listener with iocp")?;
 
         let iocp_handle = port.as_win32_handle();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
 
         let thread_handle = thread::spawn(move || {
             debug!("entering unix stream sink thread");
@@ -740,9 +755,10 @@ impl UnixStreamSink {
                         last_buffer_pool_prune = time::Instant::now();
                     }
 
-                    // This will block until an I/O operation has completed
+                    // Use a finite poll so the shared stop flag is still an escape path if
+                    // posting the dedicated stop packet ever fails.
                     let num_removed = port
-                        .poll_many(None, &mut entries)
+                        .poll_many(Some(Self::STOP_POLL_INTERVAL), &mut entries)
                         .context("could not poll with iocp")?;
 
                     for entry in entries[..num_removed as usize].iter() {
@@ -791,7 +807,7 @@ impl UnixStreamSink {
                         }
                     }
 
-                    if should_cleanup {
+                    if should_cleanup || stop_clone.load(Ordering::Acquire) {
                         Self::cleanup(listener, listener_key, port, entries, streams_queue)?;
                         break;
                     }
@@ -806,6 +822,7 @@ impl UnixStreamSink {
 
         Ok(Self {
             iocp_handle,
+            stop,
             thread_handle: Some(thread_handle),
         })
     }
@@ -833,14 +850,13 @@ impl UnixStreamSink {
                 .log_if_err();
         }
 
-        // MSDN states that we must wait for I/O operations to complete (even if canceled)
-        // before dropping OVERLAPPED structs to avoid use-after-free, so we'll wait below.
+        // Canceled OVERLAPPED requests still own their buffers until completion is dequeued. There
+        // is intentionally no timeout here: timing out and dropping streams_queue would free memory
+        // that the kernel may still reference.
         while !streams_queue.is_empty() {
-            // NOTE: poll_many() should return an error after the timeout.
-            let timeout = time::Duration::from_secs(1);
             let num_removed = port
-                .poll_many(Some(timeout), &mut entries)
-                .context("could not poll with iocp")?;
+                .poll_many(None, &mut entries)
+                .context("could not drain canceled i/o from iocp")?;
 
             for entry in entries[..num_removed as usize].iter() {
                 if entry.lpCompletionKey == listener_key {
@@ -861,22 +877,25 @@ impl UnixStreamSink {
 
 impl Drop for UnixStreamSink {
     fn drop(&mut self) {
-        let post_res =
-            unsafe { PostQueuedCompletionStatus(self.iocp_handle, 0, Self::STOP_PACKET_KEY, None) };
-
-        match post_res {
-            Ok(()) => match self.thread_handle.take() {
-                Some(handle) => {
-                    if let Err(err) = handle.join() {
-                        error!("could not join unix stream sink thread handle: {err:?}");
-                    }
-                }
-                None => error!("could not take unix stream sink thread handle"),
-            },
-            Err(err) => error!(
+        self.stop.store(true, Ordering::Release);
+        if let Err(err) =
+            unsafe { PostQueuedCompletionStatus(self.iocp_handle, 0, Self::STOP_PACKET_KEY, None) }
+        {
+            // The worker also polls the shared stop flag at a bounded interval, so a failed stop
+            // packet cannot orphan the JoinHandle.
+            error!(
                 "could not post stop packet to iocp {:?} for unix stream sink: {err:#}",
                 self.iocp_handle
-            ),
+            );
+        }
+
+        match self.thread_handle.take() {
+            Some(handle) => {
+                if let Err(err) = handle.join() {
+                    error!("could not join unix stream sink thread handle: {err:?}");
+                }
+            }
+            None => error!("could not take unix stream sink thread handle"),
         }
     }
 }

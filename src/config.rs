@@ -23,8 +23,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_INFORMATION,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{
@@ -33,6 +33,7 @@ use windows::Win32::System::Threading::{
 use windows::core::PCWSTR;
 
 const DEFAULT_CONFIG: &str = include_str!("resources/config.yaml");
+const CONFIG_WATCHER_BUFFER_SIZE: usize = 8192;
 
 const CONFIG_RELOAD_IDLE: u8 = 0;
 const CONFIG_RELOAD_PENDING: u8 = 1;
@@ -111,18 +112,27 @@ pub fn request_config_reload() {
     }
 }
 
-/// Stops accepting reload requests and waits for the current management worker to finish. Call
-/// this before destroying borders or background services so a late reload cannot recreate either.
-pub fn begin_config_shutdown() {
-    CONFIG_RELOAD_SHUTTING_DOWN.store(true, Ordering::Release);
+/// Closes the reload gate immediately. Returns true only for the first shutdown request.
+pub fn signal_config_shutdown() -> bool {
+    let first = !CONFIG_RELOAD_SHUTTING_DOWN.swap(true, Ordering::AcqRel);
     CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+    first
+}
 
+/// Joins the current management worker after the shutdown gate has been closed.
+pub fn join_config_reload_worker() {
     let handle = CONFIG_RELOAD_WORKER.lock().unwrap().take();
     if let Some(handle) = handle
         && let Err(err) = handle.join()
     {
         error!("config reload worker panicked during shutdown: {err:?}");
     }
+}
+
+/// Synchronous convenience wrapper for non-UI callers.
+pub fn begin_config_shutdown() {
+    signal_config_shutdown();
+    join_config_reload_worker();
 }
 
 fn mark_config_reload_requested(state: &AtomicU8) -> bool {
@@ -675,7 +685,7 @@ impl ConfigWatcher {
             let events = [changed_event, stop_event];
             const WAIT_OBJECT_1: WAIT_EVENT = WAIT_EVENT(WAIT_OBJECT_0.0 + 1);
 
-            let mut buffer = [0u8; 1024];
+            let mut buffer = [0u8; CONFIG_WATCHER_BUFFER_SIZE];
 
             loop {
                 let mut overlapped = OVERLAPPED {
@@ -688,7 +698,7 @@ impl ConfigWatcher {
                     buffer.as_mut_ptr() as _,
                     buffer.len() as u32,
                     false,
-                    FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME,
                     None,
                     Some(ptr::addr_of_mut!(overlapped)),
                     None,
@@ -736,17 +746,31 @@ impl ConfigWatcher {
                     break;
                 }
 
-                Self::process_dir_change_notifs(&buffer, bytes_returned, &config_name, callback_fn);
+                let should_reload = if bytes_returned == 0 {
+                    // ReadDirectoryChangesW reports zero bytes when its internal notification
+                    // buffer overflows. We cannot know which file changed, so conservatively reload.
+                    warn!(
+                        "config watcher notification buffer overflowed; reloading conservatively"
+                    );
+                    true
+                } else {
+                    Self::contains_config_change(&buffer, bytes_returned, &config_name)
+                };
 
-                // Keep debounce interruptible by the same stop event. There is no pending I/O in
-                // this interval, so a stop can exit immediately without any cancellation step.
-                let debounce_result = WaitForSingleObject(stop_event, debounce_ms);
-                if debounce_result == WAIT_OBJECT_0 {
-                    break;
-                }
-                if debounce_result != WAIT_TIMEOUT {
-                    error!("could not wait during config watcher debounce: {debounce_result:?}");
-                    break;
+                if should_reload {
+                    // Debounce before the callback so atomic-save rename/write bursts settle before
+                    // Config::create() reads the file. The wait is still interruptible by shutdown.
+                    let debounce_result = WaitForSingleObject(stop_event, debounce_ms);
+                    if debounce_result == WAIT_OBJECT_0 {
+                        break;
+                    }
+                    if debounce_result != WAIT_TIMEOUT {
+                        error!(
+                            "could not wait during config watcher debounce: {debounce_result:?}"
+                        );
+                        break;
+                    }
+                    callback_fn();
                 }
             }
 
@@ -761,35 +785,41 @@ impl ConfigWatcher {
         })
     }
 
-    pub fn process_dir_change_notifs(
-        buffer: &[u8; 1024],
-        bytes_returned: u32,
-        config_name: &str,
-        callback_fn: fn(),
-    ) {
-        let mut offset = 0usize;
+    fn contains_config_change(buffer: &[u8], bytes_returned: u32, config_name: &str) -> bool {
+        if bytes_returned == 0 || bytes_returned as usize > buffer.len() {
+            return true;
+        }
 
+        let mut offset = 0usize;
         while offset < bytes_returned as usize {
             let info = unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_NOTIFY_INFORMATION) };
-
-            // We divide FileNameLength by 2 because it's in bytes (u8), but FileName is in u16
             let name_slice = unsafe {
                 slice::from_raw_parts(info.FileName.as_ptr(), info.FileNameLength as usize / 2)
             };
             let file_name = String::from_utf16_lossy(name_slice);
             debug!("file changed: {file_name}");
 
-            if file_name == *config_name {
-                callback_fn();
-                break; // Prevent multiple callbacks from the same notification
+            if file_name == config_name {
+                return true;
             }
 
-            // If NextEntryOffset = 0, then we have reached the end of the notification
             if info.NextEntryOffset == 0 {
                 break;
-            } else {
-                offset += info.NextEntryOffset as usize
             }
+            offset += info.NextEntryOffset as usize;
+        }
+
+        false
+    }
+
+    pub fn process_dir_change_notifs(
+        buffer: &[u8],
+        bytes_returned: u32,
+        config_name: &str,
+        callback_fn: fn(),
+    ) {
+        if Self::contains_config_change(buffer, bytes_returned, config_name) {
+            callback_fn();
         }
     }
 }
@@ -800,8 +830,8 @@ impl Drop for ConfigWatcher {
         // yet it will observe the stop as soon as it reaches WaitForMultipleObjects.
         if let Err(err) = unsafe { SetEvent(self.stop_event.0) } {
             error!("could not signal config watcher stop event: {err:#}");
-            // This is only a fallback for an invalid stop-event failure. With a valid event the
-            // worker cancels its own exact OVERLAPPED request.
+            // Cancellation signals the OVERLAPPED event and gives the worker an independent escape
+            // path if signaling the stop event itself failed.
             let _ = unsafe { CancelIoEx(self.dir_handle.0, None) };
         }
 
@@ -825,10 +855,16 @@ pub fn config_watcher_callback() {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::{
-        CONFIG_RELOAD_DIRTY, CONFIG_RELOAD_IDLE, CONFIG_RELOAD_PENDING, finish_config_reload_pass,
-        mark_config_reload_requested,
+        CONFIG_RELOAD_DIRTY, CONFIG_RELOAD_IDLE, CONFIG_RELOAD_PENDING, ConfigWatcher,
+        finish_config_reload_pass, mark_config_reload_requested,
     };
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    static DIR_CHANGE_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_dir_change_callback() {
+        DIR_CHANGE_CALLBACKS.fetch_add(1, Ordering::AcqRel);
+    }
 
     #[test]
     fn config_reload_gate_coalesces_and_runs_one_trailing_pass() {
@@ -849,5 +885,17 @@ mod lifecycle_tests {
         assert!(mark_config_reload_requested(&state));
         assert!(!finish_config_reload_pass(&state));
         assert!(mark_config_reload_requested(&state));
+    }
+
+    #[test]
+    fn config_watcher_zero_byte_overflow_triggers_reload() {
+        DIR_CHANGE_CALLBACKS.store(0, Ordering::Release);
+        ConfigWatcher::process_dir_change_notifs(
+            &[0u8; 1],
+            0,
+            "config.yaml",
+            count_dir_change_callback,
+        );
+        assert_eq!(DIR_CHANGE_CALLBACKS.load(Ordering::Acquire), 1);
     }
 }

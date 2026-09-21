@@ -1,15 +1,16 @@
 use anyhow::Context;
 use std::iter;
 use std::thread::{self, JoinHandle};
-use std::time;
 
 use windows::Win32::Foundation::{
-    HANDLE, WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
+    HANDLE, WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Registry::{
     HKEY, KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET, RegNotifyChangeKeyValue, RegOpenKeyExW,
 };
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
+use windows::Win32::System::Threading::{
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+};
 use windows::core::PCWSTR;
 
 use winreg::RegKey;
@@ -145,8 +146,16 @@ impl ThemeWatcher {
                         if current_theme { "light" } else { "dark" }
                     );
 
-                    // Small delay for the system to finish the theme transition
-                    thread::sleep(time::Duration::from_millis(200));
+                    // Keep the settle delay interruptible so shutdown never waits on a
+                    // blind sleep or posts a late reload after the stop event is signaled.
+                    let settle_result = unsafe { WaitForSingleObject(events[1], 200) };
+                    if settle_result == WAIT_OBJECT_0 {
+                        break;
+                    }
+                    if settle_result != WAIT_TIMEOUT {
+                        error!("could not wait for theme transition settle: {settle_result:?}");
+                        break;
+                    }
 
                     reload_borders();
                 }
@@ -166,21 +175,22 @@ impl ThemeWatcher {
 
 impl Drop for ThemeWatcher {
     fn drop(&mut self) {
-        let set_res = unsafe { SetEvent(self.stop_event.0) };
-
-        match set_res {
-            Ok(()) => match self.thread_handle.take() {
-                Some(handle) => {
-                    if let Err(err) = handle.join() {
-                        error!("could not join theme watcher thread handle: {err:?}");
-                    }
-                }
-                None => error!("could not take theme watcher thread handle"),
-            },
-            Err(err) => error!(
+        if let Err(err) = unsafe { SetEvent(self.stop_event.0) } {
+            error!(
                 "could not signal stop event on {:?} for theme watcher: {err:#}",
                 self.stop_event
-            ),
+            );
+        }
+
+        // Always resolve ownership of the worker. If the event handle itself is invalid, the
+        // worker's wait fails and exits rather than leaving a detached JoinHandle behind.
+        match self.thread_handle.take() {
+            Some(handle) => {
+                if let Err(err) = handle.join() {
+                    error!("could not join theme watcher thread handle: {err:?}");
+                }
+            }
+            None => error!("could not take theme watcher thread handle"),
         }
     }
 }
