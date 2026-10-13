@@ -73,10 +73,12 @@ fn test_border_drawer_update() -> anyhow::Result<()> {
     prepare_v2_render_backend()?;
 
     let mut border_drawer = BorderDrawer::default();
-    let mut config = BorderConfig::default();
-    config.width = WidthConfig::new(4.0);
-    config.offset = OffsetConfig::new(-1);
-    config.radius = RadiusConfig::Custom(8.0);
+    let config = BorderConfig {
+        width: WidthConfig::new(4.0),
+        offset: OffsetConfig::new(-1),
+        radius: RadiusConfig::Custom(8.0),
+        ..Default::default()
+    };
 
     border_drawer.configure_appearance(&config, 96, HWND::default());
     border_drawer.init(

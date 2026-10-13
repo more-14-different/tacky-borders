@@ -56,10 +56,10 @@ pub extern "system" fn process_win_event(
         EVENT_SYSTEM_MINIMIZEEND => {
             request_window_event(_hwnd, BorderWindowEvent::MinimizeEnd);
         }
-        EVENT_OBJECT_DESTROY => {
-            if _id_object == OBJID_WINDOW.0 && _id_child == CHILDID_SELF as i32 {
-                request_destroy_observed_window(_hwnd);
-            }
+        EVENT_OBJECT_DESTROY
+            if _id_object == OBJID_WINDOW.0 && _id_child == CHILDID_SELF as i32 =>
+        {
+            request_destroy_observed_window(_hwnd);
         }
         _ => {}
     }

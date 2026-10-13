@@ -558,13 +558,24 @@ impl WindowBorder {
         let config = match is_active {
             true => {
                 self.config.active_color = config;
-                &self.config.active_color
+                self.config.active_color.clone()
             }
             false => {
                 self.config.inactive_color = config;
-                &self.config.inactive_color
+                self.config.inactive_color.clone()
             }
         };
+
+        let replacement = config.to_color_brush(is_active);
+        if matches!(self.drawer.render_backend, RenderBackend::None) {
+            // Color updates may race initialize_delay. Keep the latest brush configuration so
+            // BorderDrawer::init() can create it later, but do not query an uninitialized brush.
+            match is_active {
+                true => self.drawer.active_color = replacement,
+                false => self.drawer.inactive_color = replacement,
+            }
+            return;
+        }
 
         let bounds = self.compute_border_bounds();
 
@@ -576,15 +587,12 @@ impl WindowBorder {
         let old_opacity = brush.get_opacity().unwrap_or_default();
         let old_transform = brush.get_transform().unwrap_or_default();
 
-        *brush = config.to_color_brush(is_active);
+        *brush = replacement;
 
         let renderer: &ID2D1RenderTarget = match self.drawer.render_backend {
             RenderBackend::V2(ref backend) => &backend.d2d_context,
             RenderBackend::Legacy(ref backend) => &backend.render_target,
-            RenderBackend::None => {
-                error!("render backend is None in update_color_brush()");
-                return;
-            }
+            RenderBackend::None => unreachable!("render backend readiness was checked above"),
         };
         let brush_properties = D2D1_BRUSH_PROPERTIES {
             opacity: old_opacity,
@@ -834,14 +842,14 @@ impl WindowBorder {
             return;
         }
 
+        self.is_paused = false;
         if self.should_show_border() {
             self.update_color_from_state(Some(self.config.unminimize_delay));
             self.update_window_rect().log_if_err();
             self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
             self.render().log_if_err();
-            self.start_animation_clock_if_needed();
+            self.resume_animation_clock_if_needed();
         }
-        self.is_paused = false;
     }
 
     fn start_animation_clock_if_needed(&mut self) {
@@ -859,6 +867,13 @@ impl WindowBorder {
         self.drawer.reset_animation_clock();
         request_set_border_animation(identity, Some(self.drawer.animation_fps()));
         self.animation_registered = true;
+    }
+
+    fn resume_animation_clock_if_needed(&mut self) {
+        // Cloak/minimize pauses animation ticks as well as unregistering the clock. Clear the
+        // pause before re-registering so the first queued tick cannot be discarded.
+        self.is_paused = false;
+        self.start_animation_clock_if_needed();
     }
 
     fn stop_animation_clock(&mut self) {
@@ -930,9 +945,14 @@ impl WindowBorder {
             return;
         }
 
+        let should_show = self.should_show_border();
         self.update_color_from_state(None);
-        self.update_position(None).log_if_err();
+        self.update_position(should_show.then_some(SWP_SHOWWINDOW))
+            .log_if_err();
         self.render().log_if_err();
+        if should_show {
+            self.resume_animation_clock_if_needed();
+        }
     }
 
     pub fn handle_show_uncloaked(&mut self) {
@@ -947,14 +967,14 @@ impl WindowBorder {
             return;
         }
 
+        self.is_paused = false;
         if self.should_show_border() {
             self.update_color_from_state(None);
             self.update_window_rect().log_if_err();
             self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
             self.render().log_if_err();
-            self.start_animation_clock_if_needed();
+            self.resume_animation_clock_if_needed();
         }
-        self.is_paused = false;
     }
 
     pub fn handle_hide_cloaked(&mut self) {
@@ -1063,7 +1083,9 @@ impl WindowBorder {
         };
 
         self.update_color_brush(true, active_color_config);
-        self.render().log_if_err();
+        if !matches!(self.drawer.render_backend, RenderBackend::None) {
+            self.render().log_if_err();
+        }
     }
 
     pub fn handle_recreate_drawer(&mut self) {
@@ -1098,7 +1120,9 @@ impl WindowBorder {
         if let Some(inactive_config) = inactive {
             self.update_color_brush(false, inactive_config);
         }
-        self.render().log_if_err();
+        if !matches!(self.drawer.render_backend, RenderBackend::None) {
+            self.render().log_if_err();
+        }
     }
 
     pub fn apply_width(&mut self, width_config: WidthConfig) {
@@ -1340,5 +1364,113 @@ impl WindowBorder {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::animations::AnimationsConfig;
+    use crate::border_runtime::BorderRuntimeHost;
+    use crate::config::WidthConfig;
+    use crate::register_border_window_class;
+    use serial_test::serial;
+    use std::time::{Duration, Instant};
+    use windows::Win32::UI::WindowsAndMessaging::{WS_OVERLAPPEDWINDOW, WS_VISIBLE};
+
+    #[test]
+    #[serial]
+    fn color_update_before_renderer_is_cached_for_initialization() -> anyhow::Result<()> {
+        register_border_window_class()?;
+        let mut border = WindowBorder::new(HWND::default())?;
+        let active_color = ColorBrushConfig::Solid("#123456".to_string());
+
+        border.apply_colors(Some(active_color.clone()), None);
+
+        assert_eq!(border.config.active_color, active_color);
+        assert!(matches!(border.drawer.render_backend, RenderBackend::None));
+        assert!(border.drawer.active_color.get_opacity().is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn cloak_then_foreground_restores_fade_to_active_opacity() -> anyhow::Result<()> {
+        register_border_window_class()?;
+        let _runtime = BorderRuntimeHost::new()?;
+        let tracking_window = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("tacky-borders animation regression test"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                400,
+                300,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        let identity = WindowIdentity::capture(tracking_window.0)
+            .context("could not capture regression-test window identity")?;
+        let mut border = WindowBorder::new_tracked(tracking_window.0, identity)?;
+
+        let animations: AnimationsConfig = serde_yaml_ng::from_str(
+            r#"
+active:
+  - type: Fade
+    duration: 1
+inactive:
+  - type: Fade
+    duration: 1
+fps: 60
+enabled: true
+"#,
+        )?;
+        border.config = BorderConfig {
+            render_backend: RenderBackendConfig::Legacy,
+            width: WidthConfig::new(4.0),
+            follow_native_border: false,
+            active_color: ColorBrushConfig::Solid("#ff0000".to_string()),
+            inactive_color: ColorBrushConfig::Solid("#0000ff".to_string()),
+            animations,
+            ..Default::default()
+        };
+        border.current_monitor = monitor_from_window(tracking_window.0);
+        border.current_dpi = 96;
+        border.border_offset = border.config.offset_at(border.current_dpi);
+        border
+            .drawer
+            .configure_appearance(&border.config, border.current_dpi, tracking_window.0);
+        border.border_padding = border.config.border_padding(&border.drawer);
+        border.update_window_rect()?;
+        border.raw_init_drawer()?;
+
+        border.window_state = WindowState::Inactive;
+        border.update_color_from_state(Some(0));
+        border.start_animation_clock_if_needed();
+        assert!(border.animation_registered);
+        assert_eq!(border.drawer.active_color.get_opacity()?, 0.0);
+
+        border.handle_hide_cloaked();
+        assert!(border.is_paused);
+        assert!(!border.animation_registered);
+
+        // Simulate the observed recovery ordering: Cloak is gone, but foreground arrives without
+        // a matching show/uncloaked callback. Foreground must make the hidden border live again.
+        border.handle_foreground_change(true);
+        assert!(!border.is_paused);
+        assert!(border.animation_registered);
+
+        border.drawer.last_anim_time = Some(Instant::now() - Duration::from_millis(10));
+        border.animation_tick();
+        assert_eq!(border.drawer.active_color.get_opacity()?, 1.0);
+        assert_eq!(border.drawer.inactive_color.get_opacity()?, 0.0);
+
+        Ok(())
     }
 }

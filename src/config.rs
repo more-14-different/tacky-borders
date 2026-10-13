@@ -382,7 +382,7 @@ impl WidthConfig {
     // TODO: Maybe rename this and other to_x methods to to_raw or smth idk
     /// Returns a DPI-adjusted raw width value
     pub fn to_width(&self, dpi: f32) -> i32 {
-        (self.0 as f32 * dpi / 96.0).round() as i32
+        (self.0 * dpi / 96.0).round() as i32
     }
 
     fn serde_default() -> Self {
@@ -604,11 +604,11 @@ impl Config {
             || self.window_rules.iter().any(|rule| {
                 rule.active_color
                     .as_ref()
-                    .map_or(false, Self::is_color_theme_aware)
+                    .is_some_and(Self::is_color_theme_aware)
                     || rule
                         .inactive_color
                         .as_ref()
-                        .map_or(false, Self::is_color_theme_aware)
+                        .is_some_and(Self::is_color_theme_aware)
             })
     }
 

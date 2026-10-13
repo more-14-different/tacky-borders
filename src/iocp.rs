@@ -728,6 +728,17 @@ pub struct UnixStreamSink {
     thread_handle: Option<JoinHandle<()>>,
 }
 
+struct UnixStreamSinkCleanupState {
+    listener: UnixListener,
+    listener_key: usize,
+    port: CompletionPortHandle,
+    preserve_port: Arc<AtomicBool>,
+    entries: Vec<OVERLAPPED_ENTRY>,
+    next_dequeued_entry: usize,
+    num_dequeued_entries: usize,
+    streams_queue: VecDeque<(usize, Box<UnixStream>)>,
+}
+
 impl UnixStreamSink {
     const MAX_COMPLETION_EVENTS: usize = 8;
     const BUFFER_POOL_PRUNE_INTERVAL: time::Duration = time::Duration::from_secs(600);
@@ -881,16 +892,16 @@ impl UnixStreamSink {
 
             // This epilogue is intentionally unconditional. It runs after success, Result errors,
             // and callback panics before the panic is resumed.
-            let cleanup_result = Self::cleanup(
+            let cleanup_result = Self::cleanup(UnixStreamSinkCleanupState {
                 listener,
                 listener_key,
-                worker_port,
-                &preserve_port_worker,
+                port: worker_port,
+                preserve_port: preserve_port_worker,
                 entries,
                 next_dequeued_entry,
                 num_dequeued_entries,
                 streams_queue,
-            );
+            });
             if let Err(err) = cleanup_result {
                 error!("could not safely clean up unix stream sink worker: {err:#}");
             }
@@ -917,16 +928,18 @@ impl UnixStreamSink {
         })
     }
 
-    fn cleanup(
-        listener: UnixListener,
-        listener_key: usize,
-        port: CompletionPortHandle,
-        preserve_port: &AtomicBool,
-        mut entries: Vec<OVERLAPPED_ENTRY>,
-        next_dequeued_entry: usize,
-        num_dequeued_entries: usize,
-        mut streams_queue: VecDeque<(usize, Box<UnixStream>)>,
-    ) -> anyhow::Result<()> {
+    fn cleanup(state: UnixStreamSinkCleanupState) -> anyhow::Result<()> {
+        let UnixStreamSinkCleanupState {
+            listener,
+            listener_key,
+            port,
+            preserve_port,
+            mut entries,
+            next_dequeued_entry,
+            num_dequeued_entries,
+            mut streams_queue,
+        } = state;
+
         // A fallible operation or callback panic can stop processing partway through a batch
         // returned by GetQueuedCompletionStatusEx. Those entries have already left the port, so
         // account for them before waiting for any completions that remain queued in the kernel.
@@ -945,7 +958,7 @@ impl UnixStreamSink {
                 return Err(Self::preserve_pending_io_on_cleanup_failure(
                     listener,
                     streams_queue,
-                    preserve_port,
+                    &preserve_port,
                     anyhow::Error::msg(format!(
                         "could not find completion key {key} in partially processed iocp batch"
                     )),
@@ -979,7 +992,7 @@ impl UnixStreamSink {
                     return Err(Self::preserve_pending_io_on_cleanup_failure(
                         listener,
                         streams_queue,
-                        preserve_port,
+                        &preserve_port,
                         anyhow::Error::new(err),
                     ));
                 }
@@ -1002,7 +1015,7 @@ impl UnixStreamSink {
                     return Err(Self::preserve_pending_io_on_cleanup_failure(
                         listener,
                         streams_queue,
-                        preserve_port,
+                        &preserve_port,
                         anyhow::Error::msg(format!(
                             "could not find completion key {key} while draining canceled i/o"
                         )),
