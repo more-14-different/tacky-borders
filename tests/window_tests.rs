@@ -3,28 +3,20 @@ use std::{thread, time};
 use tacky_borders::border_runtime::{
     BorderRuntimeHost, BorderRuntimeSnapshot, request_runtime_snapshot,
 };
+use tacky_borders::utils::enum_windows_allow_empty;
 use tacky_borders::utils::get_window_class;
 use tacky_borders::{
     create_borders_for_existing_windows, destroy_borders, register_border_window_class,
     reload_borders,
 };
-use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, HWND, LPARAM, SetLastError, TRUE};
+use windows::Win32::Foundation::{HWND, LPARAM, TRUE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
 };
 use windows::core::BOOL;
 
 fn assert_no_border_windows() -> anyhow::Result<()> {
-    unsafe {
-        SetLastError(ERROR_SUCCESS);
-        let res = EnumWindows(Some(enum_windows_tests_callback), LPARAM::default());
-        if let Err(err) = res {
-            let last_err = GetLastError();
-            if last_err != ERROR_SUCCESS && err.code().0 != 0 {
-                return Err(err.into());
-            }
-        }
-    }
+    enum_windows_allow_empty(Some(enum_windows_tests_callback), LPARAM::default())?;
     Ok(())
 }
 

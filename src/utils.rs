@@ -30,10 +30,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged, IsWindowVisible, PostMessageW,
-    RealGetWindowClassW, SendMessageW, SendNotifyMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CHILD,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    DestroyWindow, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged,
+    IsWindowVisible, PostMessageW, RealGetWindowClassW, SendMessageW, SendNotifyMessageW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDENUMPROC, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_WINDOWEDGE, WS_MAXIMIZE,
 };
 use windows::core::{BOOL, HRESULT, PWSTR};
 
@@ -661,6 +662,23 @@ pub fn get_foreground_window() -> HWND {
     unsafe { GetForegroundWindow() }
 }
 
+/// Runs `EnumWindows` while preserving its documented empty-desktop semantics.
+///
+/// The Windows API returns zero both for a real failure and when enumeration stops without a
+/// callback-provided error. The `windows` crate maps either case to `Err`, so clear last-error
+/// first and treat a zero result with `ERROR_SUCCESS` as a successful empty enumeration.
+pub fn enum_windows_allow_empty(
+    callback: WNDENUMPROC,
+    lparam: LPARAM,
+) -> windows::core::Result<()> {
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    match unsafe { EnumWindows(callback, lparam) } {
+        Ok(()) => Ok(()),
+        Err(_) if get_last_error() == ERROR_SUCCESS => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 pub fn post_message_w(
     hwnd: Option<HWND>,
     msg: u32,
@@ -896,9 +914,33 @@ pub fn cubic_bezier(control_points: &[f32; 4]) -> Result<impl Fn(f32) -> f32 + u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Foundation::ERROR_MOD_NOT_FOUND;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_MOD_NOT_FOUND, FALSE};
     use windows::Win32::UI::WindowsAndMessaging::CreateWindowExW;
     use windows::core::w;
+
+    unsafe extern "system" fn stop_enumeration_without_error(_hwnd: HWND, _lparam: LPARAM) -> BOOL {
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        FALSE
+    }
+
+    unsafe extern "system" fn stop_enumeration_with_error(_hwnd: HWND, _lparam: LPARAM) -> BOOL {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        FALSE
+    }
+
+    #[test]
+    fn enum_windows_accepts_zero_return_without_last_error() {
+        enum_windows_allow_empty(Some(stop_enumeration_without_error), LPARAM::default()).expect(
+            "a zero EnumWindows result with ERROR_SUCCESS should mean an empty enumeration",
+        );
+    }
+
+    #[test]
+    fn enum_windows_preserves_real_errors() {
+        let err = enum_windows_allow_empty(Some(stop_enumeration_with_error), LPARAM::default())
+            .expect_err("a callback-provided error must be preserved");
+        assert_eq!(err.code(), HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+    }
 
     #[test]
     fn empty_window_title_does_not_reuse_stale_last_error() -> anyhow::Result<()> {

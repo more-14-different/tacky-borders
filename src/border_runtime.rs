@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, EnumWindows, GWLP_USERDATA,
+    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GWLP_USERDATA,
     GetWindowLongPtrW, HWND_MESSAGE, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer,
     SetWindowLongPtrW, WM_APP, WM_CREATE, WM_NCDESTROY, WM_TIMER, WNDCLASSEXW,
 };
@@ -26,9 +26,9 @@ use crate::colors::ColorBrushConfig;
 use crate::config::{EnableMode, OffsetConfig, RadiusConfig, WidthConfig};
 use crate::render_backend::RenderBackendConfig;
 use crate::utils::{
-    LogIfErr, OwnedHWND, WindowsCompatibleResult, get_foreground_window, get_last_error,
-    get_window_rule, has_filtered_style, is_current_process_elevated, is_process_elevated,
-    is_window_cloaked, is_window_top_level, is_window_visible, post_message_w,
+    LogIfErr, OwnedHWND, WindowsCompatibleResult, enum_windows_allow_empty, get_foreground_window,
+    get_last_error, get_window_rule, has_filtered_style, is_current_process_elevated,
+    is_process_elevated, is_window_cloaked, is_window_top_level, is_window_visible, post_message_w,
 };
 use crate::window_border::WindowBorder;
 use crate::{APP_STATE, DirectXDevices};
@@ -820,10 +820,6 @@ impl BorderRuntime {
     }
 
     fn update_foreground(&mut self, new_active_hwnd: HWND) {
-        if new_active_hwnd.is_invalid() {
-            return;
-        }
-
         let old_active_hwnd = HWND(self.active_window as _);
         if old_active_hwnd == new_active_hwnd {
             return;
@@ -890,10 +886,7 @@ impl BorderRuntime {
         self.destroy_all_borders();
         APP_STATE.initial_windows.lock().unwrap().clear();
 
-        let current_fg = get_foreground_window();
-        if !current_fg.is_invalid() {
-            self.active_window = current_fg.0 as isize;
-        }
+        self.update_foreground(get_foreground_window());
 
         if let Err(err) = sync_directx_devices_with_config() {
             error!("could not synchronize DirectX devices while reloading borders: {err:#}");
@@ -1260,7 +1253,7 @@ impl BorderRuntime {
     fn reconcile_foreground(&mut self) {
         let new_active_hwnd = get_foreground_window();
         let old_active_hwnd = HWND(self.active_window as _);
-        if new_active_hwnd != old_active_hwnd && !new_active_hwnd.is_invalid() {
+        if new_active_hwnd != old_active_hwnd {
             self.update_foreground(new_active_hwnd);
         }
     }
@@ -1468,12 +1461,10 @@ impl WindowSnapshot {
             current_process_elevated,
             ..Default::default()
         };
-        unsafe {
-            EnumWindows(
-                Some(enum_windows_snapshot_callback),
-                LPARAM(ptr::addr_of_mut!(snapshot) as isize),
-            )
-        }
+        enum_windows_allow_empty(
+            Some(enum_windows_snapshot_callback),
+            LPARAM(ptr::addr_of_mut!(snapshot) as isize),
+        )
         .context("could not enumerate windows for border reconciliation")?;
         Ok(snapshot)
     }
@@ -1510,6 +1501,7 @@ mod tests {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::D2DERR_RECREATE_TARGET;
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
     use windows::core::HRESULT;
 
@@ -1696,6 +1688,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(runtime.snapshot().active_window, 0x1234);
+    }
+
+    #[test]
+    fn invalid_foreground_clears_runtime_active_window() {
+        let mut runtime = BorderRuntime {
+            active_window: 0x1234,
+            ..Default::default()
+        };
+
+        runtime.update_foreground(HWND::default());
+
+        assert_eq!(runtime.snapshot().active_window, 0);
     }
 
     #[test]

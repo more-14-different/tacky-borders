@@ -35,8 +35,8 @@ use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
 use utils::{
     LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WindowsCompatibleResult, WindowsContext,
-    create_border_for_window, get_last_error, get_window_rule, has_filtered_style,
-    is_window_cloaked, is_window_top_level, is_window_visible,
+    create_border_for_window, enum_windows_allow_empty, get_last_error, get_window_rule,
+    has_filtered_style, is_window_cloaked, is_window_top_level, is_window_visible,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
@@ -66,7 +66,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_MAX, EVENT_MIN, EnumWindows, IDC_ARROW, IDNO, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    EVENT_MAX, EVENT_MIN, IDC_ARROW, IDNO, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MESSAGEBOX_RESULT,
     MESSAGEBOX_STYLE, MessageBoxW, RegisterClassExW, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WNDCLASSEXW,
@@ -176,12 +176,6 @@ impl BackgroundServices {
         let mut komorebi_integration = None;
         let mut theme_watcher = None;
         let mut ipc_server = None;
-
-        if config.enable_logging
-            && let Err(err) = create_logger()
-        {
-            eprintln!("[ERROR] could not create logger: {err:#}");
-        };
 
         if config.is_config_watcher_enabled() {
             config_watcher = create_config_watcher()
@@ -522,6 +516,15 @@ pub fn create_logger() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Initializes logging after the config has been loaded but before background producers start.
+pub fn initialize_logging() {
+    if APP_STATE.config.read().unwrap().enable_logging
+        && let Err(err) = create_logger()
+    {
+        eprintln!("[ERROR] could not create logger: {err:#}");
+    }
+}
+
 pub fn attach_parent_console() -> WindowsCompatibleResult<()> {
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }?;
     Ok(())
@@ -565,16 +568,7 @@ pub fn set_event_hook() -> HWINEVENTHOOK {
 }
 
 pub fn create_borders_for_existing_windows() -> WindowsCompatibleResult<()> {
-    unsafe {
-        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_SUCCESS);
-    }
-    let res = unsafe { EnumWindows(Some(create_borders_callback), LPARAM::default()) };
-    if let Err(err) = res {
-        let last_err = get_last_error();
-        if last_err != windows::Win32::Foundation::ERROR_SUCCESS && err.code().0 != 0 {
-            return Err(err.into());
-        }
-    }
+    enum_windows_allow_empty(Some(create_borders_callback), LPARAM::default())?;
     debug!("windows have been enumerated!");
 
     Ok(())
