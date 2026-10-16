@@ -1,0 +1,28 @@
+// VerySync rules for tacky-borders.
+// Keep source files, Cargo.lock, tests, resources, and release notes synchronized.
+#escape=\
+
+// VerySync local metadata
+(?d).verysync
+
+// Rust build outputs and local Cargo caches
+(?d)target
+(?d)target_*
+(?d)**/*.rs.bk
+(?d)**/.cargo/registry
+(?d)**/.cargo/git
+
+// Local IDE state
+(?d).vscode
+(?d).vs
+(?d).idea
+
+// Git locks and transient operation state; keep repository history synchronized
+.git/*.lock
+.git/index.lock
+.git/COMMIT_EDITMSG
+.git/TAG_EDITMSG
+.git/FETCH_HEAD
+.git/ORIG_HEAD
+.git/rebase-apply
+.git/rebase-merge
