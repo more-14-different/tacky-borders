@@ -34,8 +34,19 @@ if ($StopOnly) {
     exit 0
 }
 
+Push-Location $ProjectRoot
+try {
+    & cargo build --release
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release build failed with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    Pop-Location
+}
+
 if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
-    throw "Release executable not found: $ExePath. Build it first with 'cargo build --release'."
+    throw "Release executable not found: $ExePath"
 }
 
 $exe = Get-Item -LiteralPath $ExePath
