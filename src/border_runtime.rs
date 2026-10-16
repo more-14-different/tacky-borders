@@ -890,6 +890,11 @@ impl BorderRuntime {
         self.destroy_all_borders();
         APP_STATE.initial_windows.lock().unwrap().clear();
 
+        let current_fg = get_foreground_window();
+        if !current_fg.is_invalid() {
+            self.active_window = current_fg.0 as isize;
+        }
+
         if let Err(err) = sync_directx_devices_with_config() {
             error!("could not synchronize DirectX devices while reloading borders: {err:#}");
             return;
@@ -916,6 +921,10 @@ impl BorderRuntime {
         creatable.sort_by_key(|identity| (identity.hwnd, identity.process_id, identity.thread_id));
         for identity in creatable {
             self.create_border(identity);
+        }
+
+        if let Some(border) = self.borders.get_mut(&self.active_window) {
+            border.handle_foreground_change(true);
         }
     }
 
@@ -1121,6 +1130,11 @@ impl BorderRuntime {
             border.prepare_for_destroy();
             // OwnedHWND::drop calls DestroyWindow. We are on the same UI thread that created it.
             drop(border);
+        }
+
+        if self.active_window == expected_identity.hwnd {
+            self.active_window = 0;
+            self.reconcile_foreground();
         }
     }
 

@@ -42,6 +42,7 @@ static CONFIG_RELOAD_STATE: AtomicU8 = AtomicU8::new(CONFIG_RELOAD_IDLE);
 static CONFIG_RELOAD_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static CONFIG_RELOAD_WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 static CONFIG_ERROR_DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
+static CONFIG_RELOAD_FORCE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn show_config_error_once(message: String) {
     if CONFIG_ERROR_DIALOG_OPEN
@@ -70,6 +71,12 @@ pub(crate) fn show_config_error_once(message: String) {
         CONFIG_ERROR_DIALOG_OPEN.store(false, Ordering::Release);
         error!("could not spawn config error dialog worker: {err}");
     }
+}
+
+/// Requests a forced config reload that reloads borders even if config.yaml is unchanged.
+pub fn request_forced_config_reload() {
+    CONFIG_RELOAD_FORCE.store(true, Ordering::Release);
+    request_config_reload();
 }
 
 /// Requests a serialized config reload from a short-lived management worker. The worker is never
@@ -236,8 +243,15 @@ fn run_config_reload_worker() {
             BG_SERVICES.lock().unwrap().reload(&new_config);
         }
 
-        if old_config != new_config && !CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire) {
-            info!("config.yaml has changed; reloading borders");
+        let forced = CONFIG_RELOAD_FORCE.swap(false, Ordering::AcqRel);
+        if (forced || old_config != new_config)
+            && !CONFIG_RELOAD_SHUTTING_DOWN.load(Ordering::Acquire)
+        {
+            if forced && old_config == new_config {
+                info!("forced config reload requested; reloading borders");
+            } else {
+                info!("config.yaml has changed; reloading borders");
+            }
             reload_borders();
         }
 

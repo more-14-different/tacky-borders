@@ -8,7 +8,7 @@ use crate::BG_SERVICES;
 use crate::auto_start::{is_autostart_enabled, toggle_autostart};
 use crate::border_runtime::request_finalize_shutdown;
 use crate::config::{
-    Config, join_config_reload_worker, request_config_reload, signal_config_shutdown,
+    Config, join_config_reload_worker, request_forced_config_reload, signal_config_shutdown,
 };
 use crate::utils::LogIfErr;
 
@@ -62,7 +62,7 @@ pub fn create_tray_icon(hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon
             }
         }
         // Reload
-        "2" => request_config_reload(),
+        "2" => request_forced_config_reload(),
         // Close
         "3" => {
             // The first phase only closes producer gates on the UI callback stack. Background

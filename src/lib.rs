@@ -565,7 +565,16 @@ pub fn set_event_hook() -> HWINEVENTHOOK {
 }
 
 pub fn create_borders_for_existing_windows() -> WindowsCompatibleResult<()> {
-    unsafe { EnumWindows(Some(create_borders_callback), LPARAM::default()) }?;
+    unsafe {
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_SUCCESS);
+    }
+    let res = unsafe { EnumWindows(Some(create_borders_callback), LPARAM::default()) };
+    if let Err(err) = res {
+        let last_err = get_last_error();
+        if last_err != windows::Win32::Foundation::ERROR_SUCCESS && err.code().0 != 0 {
+            return Err(err.into());
+        }
+    }
     debug!("windows have been enumerated!");
 
     Ok(())

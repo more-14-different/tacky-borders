@@ -20,8 +20,8 @@ use tacky_borders::ipc::{IpcCommand, socket_path};
 use tacky_borders::sys_tray_icon::create_tray_icon;
 use tacky_borders::utils::{LogIfErr, imm_disable_ime, set_process_dpi_awareness_context};
 use tacky_borders::{
-    APP_STATE, attach_parent_console, create_borders_for_existing_windows, is_unwanted_instance,
-    register_border_window_class, set_event_hook,
+    APP_STATE, BG_SERVICES, attach_parent_console, create_borders_for_existing_windows,
+    is_unwanted_instance, register_border_window_class, set_event_hook,
 };
 use windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -54,8 +54,9 @@ fn run_daemon() {
         return;
     }
 
-    // Force initialization of our app state
+    // Force initialization of our app state and background services (logger, ipc server, watchers)
     let _ = LazyLock::force(&APP_STATE);
+    let _ = LazyLock::force(&BG_SERVICES);
 
     info!("starting tacky-borders");
 

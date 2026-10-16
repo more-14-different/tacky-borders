@@ -84,6 +84,7 @@ pub struct WindowBorder {
     config: BorderConfig, // cached config values
     is_paused: bool,
     is_closing: bool,
+    is_initialized: bool,
     animation_registered: bool,
     arranged_override_active: bool, // radius override for arranged/snapped tracking window
 }
@@ -120,6 +121,7 @@ impl WindowBorder {
             config: Default::default(),
             is_paused: Default::default(),
             is_closing: false,
+            is_initialized: false,
             animation_registered: false,
             arranged_override_active: false,
         });
@@ -222,6 +224,8 @@ impl WindowBorder {
             self.init_border()
                 .context("could not initialize border in init()")?;
         }
+
+        self.is_initialized = true;
 
         if let Some(identity) = self.tracking_identity {
             request_mark_border_active(identity);
@@ -773,7 +777,10 @@ impl WindowBorder {
             self.rescale_border(new_dpi);
         }
 
-        if self
+        if self.needs_drawer_recreation().unwrap_or(true) {
+            self.reinitialize_drawer()?;
+            is_updated = true;
+        } else if self
             .needs_renderer_resize()
             .context("could not check if renderer needs resizing")?
         {
@@ -942,11 +949,19 @@ impl WindowBorder {
         // Foreground events can arrive during initialize_delay. Preserve the latest state so
         // init_border renders the correct color, but do not try to draw before a backend exists.
         if matches!(self.drawer.render_backend, RenderBackend::None) {
-            return;
+            if self.is_initialized {
+                self.reinitialize_drawer().log_if_err();
+                if matches!(self.drawer.render_backend, RenderBackend::None) {
+                    return;
+                }
+            } else {
+                return;
+            }
         }
 
         let should_show = self.should_show_border();
         self.update_color_from_state(None);
+        self.update_window_rect().log_if_err();
         self.update_position(should_show.then_some(SWP_SHOWWINDOW))
             .log_if_err();
         self.render().log_if_err();

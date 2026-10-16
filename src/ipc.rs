@@ -12,7 +12,9 @@ use crate::border_runtime::{
     BorderRuntimeUpdate, request_apply_border_update, request_runtime_snapshot,
 };
 use crate::colors::ColorBrushConfig;
-use crate::config::{Config, OffsetConfig, RadiusConfig, WidthConfig, request_config_reload};
+use crate::config::{
+    Config, OffsetConfig, RadiusConfig, WidthConfig, request_forced_config_reload,
+};
 use crate::iocp::{UnixListener, UnixStream};
 use crate::utils::{LogIfErr, remove_file_if_exists};
 
@@ -184,7 +186,7 @@ fn handle_client(stream: UnixStream, stop: Arc<AtomicBool>) -> anyhow::Result<()
         // Ack first. A config reload may disable the IPC server and join this worker; starting it
         // only after the response has been written avoids racing the caller's acknowledgement.
         if reload_after_write {
-            request_config_reload();
+            request_forced_config_reload();
         }
         line.clear();
     }
