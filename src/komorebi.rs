@@ -121,20 +121,52 @@ impl KomorebiIntegration {
         let join_handle = thread::spawn(move || {
             let subscribe_bytes = unsafe { subscribe_message.as_bytes_mut() };
 
-            while !stop_clone.load(Ordering::Acquire) {
-                match write_to_unix_socket(&komorebi_socket_path, subscribe_bytes) {
-                    Ok(()) => break,
-                    Err(err) => {
-                        // The write fails when komorebi isn't running which isn't a real issue, so
-                        // keep retrying until integration shutdown explicitly wakes this thread.
-                        debug!("could not send subscribe-socket message to komorebi: {err:#}");
-                        thread::park_timeout(Self::SUBSCRIBE_RETRY_INTERVAL);
-                    }
-                }
-            }
+            Self::run_subscribe_loop(
+                &stop_clone,
+                || {
+                    std::fs::metadata(&komorebi_socket_path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                },
+                || write_to_unix_socket(&komorebi_socket_path, subscribe_bytes),
+                || thread::park_timeout(Self::SUBSCRIBE_RETRY_INTERVAL),
+            );
         });
 
         Ok((stop, join_handle))
+    }
+
+    fn run_subscribe_loop(
+        stop: &AtomicBool,
+        mut socket_generation: impl FnMut() -> Option<time::SystemTime>,
+        mut subscribe: impl FnMut() -> anyhow::Result<()>,
+        mut wait: impl FnMut(),
+    ) {
+        let mut subscribed_generation = None;
+
+        while !stop.load(Ordering::Acquire) {
+            match socket_generation() {
+                Some(generation) if subscribed_generation != Some(generation) => {
+                    match subscribe() {
+                        Ok(()) => subscribed_generation = Some(generation),
+                        Err(err) => {
+                            // The write fails when komorebi isn't running which isn't a real issue.
+                            debug!("could not send subscribe-socket message to komorebi: {err:#}");
+                        }
+                    }
+                }
+                None => {
+                    // komorebi removes and recreates its socket on restart. Forget the successful
+                    // subscription while the socket is absent so its replacement is registered.
+                    subscribed_generation = None;
+                }
+                Some(_) => {}
+            }
+
+            if !stop.load(Ordering::Acquire) {
+                wait();
+            }
+        }
     }
 
     fn get_komorebi_data_dir() -> anyhow::Result<PathBuf> {
@@ -381,8 +413,65 @@ impl Drop for KomorebiIntegration {
 #[cfg(test)]
 mod tests {
     use super::{KomorebiIntegration, WindowKind};
+    use std::cell::Cell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::Win32::Foundation::HWND;
+
+    #[test]
+    fn komorebi_subscription_is_renewed_when_socket_generation_changes() {
+        let stop = AtomicBool::new(false);
+        let polls = Cell::new(0);
+        let subscriptions = Cell::new(0);
+
+        KomorebiIntegration::run_subscribe_loop(
+            &stop,
+            || {
+                polls.set(polls.get() + 1);
+                Some(if polls.get() < 3 {
+                    std::time::UNIX_EPOCH
+                } else {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)
+                })
+            },
+            || {
+                subscriptions.set(subscriptions.get() + 1);
+                Ok(())
+            },
+            || {
+                if polls.get() == 3 {
+                    stop.store(true, Ordering::Release);
+                }
+            },
+        );
+
+        assert_eq!(subscriptions.get(), 2);
+    }
+
+    #[test]
+    fn failed_komorebi_subscription_is_retried_for_the_same_socket_generation() {
+        let stop = AtomicBool::new(false);
+        let attempts = Cell::new(0);
+
+        KomorebiIntegration::run_subscribe_loop(
+            &stop,
+            || Some(std::time::UNIX_EPOCH),
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    anyhow::bail!("transient connection failure");
+                }
+                Ok(())
+            },
+            || {
+                if attempts.get() == 2 {
+                    stop.store(true, Ordering::Release);
+                }
+            },
+        );
+
+        assert_eq!(attempts.get(), 2);
+    }
 
     #[test]
     fn malformed_komorebi_schema_is_rejected_without_mutating_previous_state() {
