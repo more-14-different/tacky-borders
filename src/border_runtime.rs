@@ -1298,6 +1298,48 @@ impl BorderRuntime {
         self.refresh_animation_timer();
     }
 
+    fn reconcile_border_states(&mut self) {
+        let active_window = self.active_window;
+        let records = self.registry.records();
+        for record in records {
+            let Some(border) = self.borders.get_mut(&record.tracking.hwnd) else {
+                continue;
+            };
+            if border.tracked_identity() != Some(record.tracking) {
+                continue;
+            }
+            border.reconcile_state(record.tracking.hwnd == active_window);
+        }
+    }
+
+    fn reconcile_animation_registrations(&mut self) {
+        let desired: HashMap<isize, AnimationRegistration> = self
+            .registry
+            .records()
+            .into_iter()
+            .filter_map(|record| {
+                let border = self.borders.get(&record.tracking.hwnd)?;
+                if border.tracked_identity() != Some(record.tracking) {
+                    return None;
+                }
+                border.desired_animation_fps().map(|fps| {
+                    (
+                        record.tracking.hwnd,
+                        AnimationRegistration {
+                            identity: record.tracking,
+                            fps: fps.max(1),
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        if self.animated != desired {
+            self.animated = desired;
+            self.refresh_animation_timer();
+        }
+    }
+
     fn reconcile_windows(&mut self) -> anyhow::Result<()> {
         self.reconcile_runtime_invariants();
 
@@ -1313,6 +1355,13 @@ impl BorderRuntime {
         for identity in plan.create {
             self.create_border(identity);
         }
+
+        // The foreground poll and WinEvents are intentionally fast paths, not the source of
+        // truth. Re-read foreground and converge every surviving border so lost/out-of-order
+        // minimize, cloak, show, location, and animation-registration events self-heal.
+        self.reconcile_foreground();
+        self.reconcile_border_states();
+        self.reconcile_animation_registrations();
 
         Ok(())
     }

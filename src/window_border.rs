@@ -1,5 +1,6 @@
 use anyhow::{Context, anyhow};
 use std::ptr;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{D2D1_BRUSH_PROPERTIES, ID2D1RenderTarget};
@@ -16,12 +17,13 @@ use windows::Win32::UI::HiDpi::MDT_DEFAULT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DBT_DEVNODES_CHANGED, DefWindowProcW,
     GW_HWNDNEXT, GW_HWNDPREV, GWLP_USERDATA, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    HWND_TOP, KillTimer, LWA_ALPHA, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
-    SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW,
-    SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, WM_CREATE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_NCDESTROY, WM_PAINT, WM_POWERBROADCAST, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
-    WS_DISABLED, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    GetWindowRect, HWND_TOP, KillTimer, LWA_ALPHA, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    PBT_APMSUSPEND, SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE,
+    SWP_NOREDRAW, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, WM_CREATE, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_NCDESTROY, WM_PAINT, WM_POWERBROADCAST, WM_TIMER, WM_WINDOWPOSCHANGED,
+    WM_WINDOWPOSCHANGING, WS_DISABLED, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -86,6 +88,7 @@ pub struct WindowBorder {
     is_closing: bool,
     is_initialized: bool,
     animation_registered: bool,
+    unminimize_ready_at: Option<Instant>,
     arranged_override_active: bool, // radius override for arranged/snapped tracking window
 }
 
@@ -123,6 +126,7 @@ impl WindowBorder {
             is_closing: false,
             is_initialized: false,
             animation_registered: false,
+            unminimize_ready_at: None,
             arranged_override_active: false,
         });
 
@@ -837,6 +841,7 @@ impl WindowBorder {
     }
 
     fn finish_unminimize(&mut self) {
+        self.unminimize_ready_at = None;
         if !self.tracking_identity_is_valid() {
             self.cleanup_and_queue_exit();
             return;
@@ -856,6 +861,45 @@ impl WindowBorder {
             self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
             self.render().log_if_err();
             self.resume_animation_clock_if_needed();
+        }
+    }
+
+    fn handle_unminimize_timer(&mut self) {
+        let Some(ready_at) = self.unminimize_ready_at else {
+            return;
+        };
+        if Instant::now() < ready_at {
+            // KillTimer does not remove an already queued WM_TIMER. Ignore a stale callback from
+            // an earlier minimize cycle and leave the timer for the current deadline armed.
+            return;
+        }
+
+        unsafe { KillTimer(Some(self.border_window.0), UNMINIMIZE_TIMER_ID) }.log_if_err();
+        self.finish_unminimize();
+    }
+
+    fn border_rect_matches_cached_rect(&self) -> bool {
+        let mut actual_rect = RECT::default();
+        if unsafe { GetWindowRect(self.border_window.0, &mut actual_rect) }.is_err() {
+            return false;
+        }
+
+        actual_rect.left == self.window_rect.left
+            && actual_rect.top == self.window_rect.top
+            && actual_rect.right == self.window_rect.right
+            && actual_rect.bottom == self.window_rect.bottom
+    }
+
+    fn border_z_order_is_correct(&self) -> bool {
+        match self.config.z_order {
+            ZOrderMode::AboveWindow => {
+                (unsafe { GetWindow(self.tracking_window, GW_HWNDPREV) })
+                    == Ok(self.border_window.0)
+            }
+            ZOrderMode::BelowWindow => {
+                (unsafe { GetWindow(self.tracking_window, GW_HWNDNEXT) })
+                    == Ok(self.border_window.0)
+            }
         }
     }
 
@@ -891,6 +935,135 @@ impl WindowBorder {
             request_set_border_animation(identity, None);
         }
         self.animation_registered = false;
+    }
+
+    fn unminimize_delay_is_pending(&mut self) -> bool {
+        match self.unminimize_ready_at {
+            Some(ready_at) if Instant::now() < ready_at => true,
+            Some(_) => {
+                self.unminimize_ready_at = None;
+                // Reconciliation, foreground, or show recovery may observe expiry before the
+                // timer callback. Consume the repeating Win32 timer along with the deadline.
+                let _ = unsafe { KillTimer(Some(self.border_window.0), UNMINIMIZE_TIMER_ID) };
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Converges the border on current OS state after a WinEvent was missed or arrived out of
+    /// order. This is intentionally idempotent: expensive position/render work only happens when
+    /// an observable part of the border has drifted.
+    pub fn reconcile_state(&mut self, is_active: bool) {
+        if self.is_closing {
+            return;
+        }
+        if !self.tracking_identity_is_valid() {
+            self.cleanup_and_queue_exit();
+            return;
+        }
+
+        let expected_state = if is_active {
+            WindowState::Active
+        } else {
+            WindowState::Inactive
+        };
+        let state_changed = self.window_state != expected_state;
+        self.window_state = expected_state;
+
+        // Initialization may be delayed. Cache foreground state now and let init_border apply it.
+        if !self.is_initialized {
+            return;
+        }
+
+        if !self.should_show_border() {
+            if is_window_visible(self.border_window.0) {
+                self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
+            }
+            self.stop_animation_clock();
+            self.is_paused = true;
+            return;
+        }
+        if self.unminimize_delay_is_pending() {
+            if is_window_visible(self.border_window.0) {
+                self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
+            }
+            self.stop_animation_clock();
+            self.is_paused = true;
+            return;
+        }
+
+        let renderer_reinitialized = if matches!(self.drawer.render_backend, RenderBackend::None) {
+            self.reinitialize_drawer().log_if_err();
+            if matches!(self.drawer.render_backend, RenderBackend::None) {
+                self.stop_animation_clock();
+                return;
+            }
+            true
+        } else {
+            false
+        };
+
+        let was_paused = self.is_paused;
+        self.is_paused = false;
+        let border_was_visible = is_window_visible(self.border_window.0);
+        let mut needs_render =
+            renderer_reinitialized || state_changed || was_paused || !border_was_visible;
+
+        let new_monitor = monitor_from_window(self.tracking_window);
+        let monitor_changed = new_monitor != self.current_monitor;
+        if monitor_changed {
+            self.current_monitor = new_monitor;
+            debug!("monitor has changed during reconciliation: {new_monitor:?}");
+        }
+        let dpi_changed = get_dpi_for_monitor(new_monitor, MDT_DEFAULT)
+            .map(|dpi| dpi != self.current_dpi)
+            .unwrap_or(false);
+        if monitor_changed || dpi_changed {
+            needs_render |= match self.rescale_border_and_resize_renderer_if_needed(new_monitor) {
+                Ok(is_updated) => is_updated,
+                Err(err) => {
+                    error!("could not reconcile border appearance and renderer: {err:#}");
+                    return;
+                }
+            };
+        }
+
+        if self.config.is_radius_auto()
+            && is_window_arranged(self.tracking_window) != self.arranged_override_active
+        {
+            needs_render |= self.sync_border_radius();
+        }
+
+        let prev_rect = self.window_rect;
+        if let Err(err) = self.update_window_rect() {
+            error!("could not reconcile border geometry: {err:#}");
+            return;
+        }
+        needs_render |= !are_rects_same_size(&self.window_rect, &prev_rect);
+
+        let position_drifted = !self.border_rect_matches_cached_rect();
+        let z_order_drifted = !self.border_z_order_is_correct();
+        if !border_was_visible || position_drifted || z_order_drifted {
+            self.update_position((!border_was_visible).then_some(SWP_SHOWWINDOW))
+                .log_if_err();
+        }
+
+        if state_changed || was_paused {
+            self.update_color_from_state(None);
+        }
+        if needs_render {
+            self.render().log_if_err();
+        }
+        self.resume_animation_clock_if_needed();
+    }
+
+    pub fn desired_animation_fps(&self) -> Option<u32> {
+        (self.animation_registered
+            && !self.is_paused
+            && !self.is_closing
+            && self.drawer.animations_enabled())
+        .then(|| self.drawer.animation_fps())
     }
 
     pub fn handle_location_change(&mut self) {
@@ -946,6 +1119,10 @@ impl WindowBorder {
         }
         self.window_state.set_active(is_active);
 
+        if self.unminimize_delay_is_pending() {
+            return;
+        }
+
         // Foreground events can arrive during initialize_delay. Preserve the latest state so
         // init_border renders the correct color, but do not try to draw before a backend exists.
         if matches!(self.drawer.render_backend, RenderBackend::None) {
@@ -981,6 +1158,9 @@ impl WindowBorder {
         {
             return;
         }
+        if self.unminimize_delay_is_pending() {
+            return;
+        }
 
         self.is_paused = false;
         if self.should_show_border() {
@@ -1007,6 +1187,10 @@ impl WindowBorder {
             self.cleanup_and_queue_exit();
             return;
         }
+        self.unminimize_ready_at = None;
+        unsafe {
+            let _ = KillTimer(Some(self.border_window.0), UNMINIMIZE_TIMER_ID);
+        }
         self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
         self.drawer.active_color.set_opacity(0.0).log_if_err();
         self.drawer.inactive_color.set_opacity(0.0).log_if_err();
@@ -1029,11 +1213,14 @@ impl WindowBorder {
         if self.config.unminimize_delay == 0 {
             self.finish_unminimize();
         } else {
+            let delay_ms = self.config.unminimize_delay.min(u32::MAX as u64) as u32;
+            self.unminimize_ready_at =
+                Instant::now().checked_add(Duration::from_millis(delay_ms as u64));
             unsafe {
                 SetTimer(
                     Some(self.border_window.0),
                     UNMINIMIZE_TIMER_ID,
-                    self.config.unminimize_delay.min(u32::MAX as u64) as u32,
+                    delay_ms,
                     None,
                 )
             };
@@ -1188,6 +1375,7 @@ impl WindowBorder {
         }
         self.is_closing = true;
         self.is_paused = true;
+        self.unminimize_ready_at = None;
         self.stop_animation_clock();
 
         // Teardown is intentionally best-effort. Any of these one-shot timers may already have
@@ -1258,8 +1446,7 @@ impl WindowBorder {
                     }
                 }
                 UNMINIMIZE_TIMER_ID => {
-                    unsafe { KillTimer(Some(window), UNMINIMIZE_TIMER_ID) }.log_if_err();
-                    self.finish_unminimize();
+                    self.handle_unminimize_timer();
                 }
                 INITIAL_RENDER_RETRY_TIMER_ID => {
                     unsafe { KillTimer(Some(window), INITIAL_RENDER_RETRY_TIMER_ID) }.log_if_err();
@@ -1411,7 +1598,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn cloak_then_foreground_restores_fade_to_active_opacity() -> anyhow::Result<()> {
+    fn reconciliation_recovers_missed_show_animation_and_geometry_events() -> anyhow::Result<()> {
         register_border_window_class()?;
         let _runtime = BorderRuntimeHost::new()?;
         let tracking_window = OwnedHWND(unsafe {
@@ -1464,6 +1651,7 @@ enabled: true
         border.border_padding = border.config.border_padding(&border.drawer);
         border.update_window_rect()?;
         border.raw_init_drawer()?;
+        border.is_initialized = true;
 
         border.window_state = WindowState::Inactive;
         border.update_color_from_state(Some(0));
@@ -1475,16 +1663,186 @@ enabled: true
         assert!(border.is_paused);
         assert!(!border.animation_registered);
 
-        // Simulate the observed recovery ordering: Cloak is gone, but foreground arrives without
-        // a matching show/uncloaked callback. Foreground must make the hidden border live again.
-        border.handle_foreground_change(true);
+        // Simulate the observed failure: the tracking window is visible again, but both the
+        // show/uncloaked and foreground callbacks were missed. Periodic reconciliation must make
+        // the hidden border live again.
+        border.reconcile_state(true);
         assert!(!border.is_paused);
         assert!(border.animation_registered);
+        assert!(is_window_visible(border.border_window.0));
+        assert_eq!(border.desired_animation_fps(), Some(60));
 
         border.drawer.last_anim_time = Some(Instant::now() - Duration::from_millis(10));
         border.animation_tick();
         assert_eq!(border.drawer.active_color.get_opacity()?, 1.0);
         assert_eq!(border.drawer.inactive_color.get_opacity()?, 0.0);
+
+        // Now drop a location event as well. The reconciler must refresh both its cached target
+        // geometry and the real border HWND instead of trusting the stale cache.
+        let old_rect = border.window_rect;
+        unsafe {
+            SetWindowPos(
+                tracking_window.0,
+                None,
+                240,
+                180,
+                640,
+                480,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )?;
+        }
+        border.reconcile_state(true);
+        assert_ne!(border.window_rect, old_rect);
+        assert!(border.border_rect_matches_cached_rect());
+
+        // Keep coverage for the fast event path too: a foreground event without a matching
+        // show/uncloaked event must still resume a previously cloaked border immediately.
+        border.handle_hide_cloaked();
+        assert!(border.is_paused);
+        border.handle_foreground_change(true);
+        assert!(!border.is_paused);
+        assert!(border.animation_registered);
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn reconciliation_renders_after_reinitializing_missing_backend() -> anyhow::Result<()> {
+        register_border_window_class()?;
+        let _runtime = BorderRuntimeHost::new()?;
+        let tracking_window = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("tacky-borders renderer recovery regression test"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                400,
+                300,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        let identity = WindowIdentity::capture(tracking_window.0)
+            .context("could not capture renderer-recovery test window identity")?;
+        let mut border = WindowBorder::new_tracked(tracking_window.0, identity)?;
+
+        border.config = BorderConfig {
+            render_backend: RenderBackendConfig::Legacy,
+            width: WidthConfig::new(4.0),
+            follow_native_border: false,
+            active_color: ColorBrushConfig::Solid("#ff0000".to_string()),
+            inactive_color: ColorBrushConfig::Solid("#0000ff".to_string()),
+            ..Default::default()
+        };
+        border.current_monitor = monitor_from_window(tracking_window.0);
+        border.current_dpi = 96;
+        border.border_offset = border.config.offset_at(border.current_dpi);
+        border
+            .drawer
+            .configure_appearance(&border.config, border.current_dpi, tracking_window.0);
+        border.border_padding = border.config.border_padding(&border.drawer);
+        border.update_window_rect()?;
+        border.raw_init_drawer()?;
+        border.is_initialized = true;
+        border.update_color_from_state(Some(0));
+        border.update_position(Some(SWP_SHOWWINDOW))?;
+        border.render()?;
+
+        border.drawer.uninit();
+        border.drawer.last_render_time = None;
+        border.reconcile_state(true);
+
+        assert!(!matches!(border.drawer.render_backend, RenderBackend::None));
+        assert!(border.drawer.last_render_time.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn pending_unminimize_delay_blocks_event_and_reconciliation_recovery() -> anyhow::Result<()> {
+        register_border_window_class()?;
+        let _runtime = BorderRuntimeHost::new()?;
+        let tracking_window = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("tacky-borders unminimize-delay regression test"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                400,
+                300,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        let identity = WindowIdentity::capture(tracking_window.0)
+            .context("could not capture unminimize-delay test window identity")?;
+        let mut border = WindowBorder::new_tracked(tracking_window.0, identity)?;
+
+        border.config = BorderConfig {
+            render_backend: RenderBackendConfig::Legacy,
+            width: WidthConfig::new(4.0),
+            follow_native_border: false,
+            unminimize_delay: 10_000,
+            active_color: ColorBrushConfig::Solid("#ff0000".to_string()),
+            inactive_color: ColorBrushConfig::Solid("#0000ff".to_string()),
+            ..Default::default()
+        };
+        border.current_monitor = monitor_from_window(tracking_window.0);
+        border.current_dpi = 96;
+        border.border_offset = border.config.offset_at(border.current_dpi);
+        border
+            .drawer
+            .configure_appearance(&border.config, border.current_dpi, tracking_window.0);
+        border.border_padding = border.config.border_padding(&border.drawer);
+        border.update_window_rect()?;
+        border.raw_init_drawer()?;
+        border.is_initialized = true;
+        border.update_color_from_state(Some(0));
+        border.update_position(Some(SWP_SHOWWINDOW))?;
+        border.render()?;
+
+        border.handle_minimize_start();
+        border.handle_minimize_end();
+        border.handle_foreground_change(true);
+        assert!(border.is_paused);
+        assert!(!is_window_visible(border.border_window.0));
+
+        border.reconcile_state(true);
+
+        assert!(border.is_paused);
+        assert!(!is_window_visible(border.border_window.0));
+
+        // KillTimer cannot remove an already queued WM_TIMER from an earlier minimize cycle.
+        // Such a stale callback must not clear the current restore deadline.
+        unsafe {
+            border.wnd_proc(
+                border.border_window.0,
+                WM_TIMER,
+                WPARAM(UNMINIMIZE_TIMER_ID),
+                LPARAM(0),
+            );
+        }
+        assert!(border.is_paused);
+        assert!(!is_window_visible(border.border_window.0));
+        assert!(border.unminimize_ready_at.is_some());
+
+        // If reconciliation is the first path to observe an expired deadline, it must also
+        // consume the repeating Win32 timer instead of leaving it armed indefinitely.
+        border.unminimize_ready_at = Some(Instant::now() - Duration::from_millis(1));
+        border.reconcile_state(true);
+        assert!(!border.is_paused);
+        assert!(is_window_visible(border.border_window.0));
+        assert!(unsafe { KillTimer(Some(border.border_window.0), UNMINIMIZE_TIMER_ID) }.is_err());
 
         Ok(())
     }
